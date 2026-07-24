@@ -1,6 +1,6 @@
 # Memory Reboot - 记忆重现
 
-> AstrBot 旧闻提醒插件 v3.6.2
+> AstrBot 旧闻提醒插件 v3.6.3
 
 当群聊中有人重复发送旧的新闻、话题或梗图时，自动识别并通过引用回复提醒该用户。
 
@@ -150,9 +150,12 @@
 | `forward_max_segments` | 单条消息最多处理的消息段数（硬上限2000） | `500` |
 | `forward_max_chars` | 单条转发最多提取的字符数（硬上限50000） | `12000` |
 | `forward_min_visible_chars` | 含不可读内层转发时，生成哈希所需的最少外层可见正文字符数（硬上限200） | `20` |
+| `forward_sender_text_match` | 忽略媒体标识，按节点顺序、发送者ID和文本进行精确匹配 | `true` |
 | `forward_debug_log` | 分段输出完整转发指纹诊断数据 | `false` |
 
 合并转发会优先按 OneBot 转发 ID 快速匹配；ID 不同时，插件展开节点并计算稳定内容哈希。OneBot 不允许读取且 ID 不稳定的内层转发会统一替换为固定占位符，不参与 ID 比较。只有外层具有足够的可见正文或稳定媒体标识时才生成哈希；这类部分可见转发不会参与 Embedding 语义匹配。深度、超时或其他安全上限被触发时仍不会生成哈希。
+
+启用 `forward_sender_text_match` 后，如果完整内容哈希因图片或文件标识变化而不同，插件还会按节点顺序、`sender_id` 和规范化文本计算第二个精确指纹。该指纹忽略所有媒体内容，只有正文总长度不少于20字且至少有2个含文本节点时才会生成。它能容忍媒体ID变化，但无法区分“发送者和文字完全相同、实际图片不同”的记录。
 
 #### 转发指纹诊断
 
@@ -251,7 +254,9 @@
   "image_hash": "a1b2c3d4e5f6g7h8...",
   "forward_id": "OneBot合并转发资源ID",
   "forward_hash": "标准化节点内容的SHA-256",
-  "forward_hash_version": 2,
+  "forward_text_hash": "节点顺序、发送者ID和文本的SHA-256",
+  "forward_text_hash_eligible": true,
+  "forward_hash_version": 3,
   "forward_node_count": 8,
   "forward_truncated": false,
   "forward_partial": true
@@ -290,6 +295,10 @@
 - `numpy>=1.21.0`
 - `aiohttp>=3.8.0`
 - `Pillow>=9.0.0` (用于图片哈希计算)
+
+### v3.6.3 新增功能
+- **发送者+文本指纹**：完整内容哈希不同时，可忽略媒体标识并按节点顺序、发送者ID和文本进行第二次精确匹配
+- **防误报限制**：发送者+文本指纹要求至少20字正文和2个文本节点，可通过配置整体关闭
 
 ### v3.6.2 新增功能
 - **转发指纹诊断**：新增 `forward_debug_log` 临时开关，分段导出完整规范化输入和哈希，便于定位文本、节点或媒体标识差异

@@ -104,6 +104,12 @@
     "hint": "内层内容无法读取时，外层可见正文至少达到此长度才生成内容哈希；存在稳定媒体段时不受此限制。默认20，插件内部硬上限为200。",
     "default": 20
   },
+  "forward_sender_text_match": {
+    "description": "启用发送者ID和文本精确匹配",
+    "type": "bool",
+    "hint": "完整内容哈希不同时，再按节点顺序、发送者ID和规范化文本精确匹配，忽略图片及文件标识。仅在正文不少于20字且至少有2个文本节点时生成指纹。",
+    "default": true
+  },
   "forward_debug_log": {
     "description": "输出合并转发指纹诊断日志",
     "type": "bool",

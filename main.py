@@ -82,7 +82,9 @@ DEFAULT_FORWARD_MAX_NODES = 100           # 单条消息最多处理转发节点
 DEFAULT_FORWARD_MAX_SEGMENTS = 500        # 单条消息最多处理消息段数
 DEFAULT_FORWARD_MAX_CHARS = 12000         # 单条消息最多提取文本字符数
 DEFAULT_FORWARD_MIN_VISIBLE_CHARS = 20    # 含不可读内层转发时最少可见正文字符数
-FORWARD_HASH_VERSION = 2                  # 转发内容指纹算法版本
+DEFAULT_FORWARD_TEXT_MATCH_MIN_CHARS = 20 # 发送者+文本指纹最少字符数
+DEFAULT_FORWARD_TEXT_MATCH_MIN_NODES = 2  # 发送者+文本指纹最少文本节点数
+FORWARD_HASH_VERSION = 3                  # 转发内容指纹算法版本
 REMINDER_IMAGE_FILENAME = "1000101866.jpg" # 提醒图片文件名
 
 
@@ -118,6 +120,7 @@ class MemoryRebootPlugin(Star):
         - forward_fetch_timeout: 单次调用get_forward_msg超时秒数
         - forward_max_nodes/segments/chars: 合并转发处理规模上限
         - forward_min_visible_chars: 内层不可读时生成哈希所需可见正文长度
+        - forward_sender_text_match: 使用发送者ID和文本精确匹配转发
         - forward_debug_log: 临时输出完整的转发指纹诊断日志
     
     性能优化:
@@ -1011,6 +1014,7 @@ class MemoryRebootPlugin(Star):
         message: Dict,
         forward_id: Optional[str],
         forward_hash: Optional[str],
+        forward_text_hash: Optional[str] = None,
     ) -> Optional[str]:
         """判断历史消息是否为同一合并转发，返回命中依据。"""
         stored_id = message.get("forward_id")
@@ -1019,6 +1023,13 @@ class MemoryRebootPlugin(Star):
         stored_hash = message.get("forward_hash")
         if forward_hash and stored_hash and stored_hash == forward_hash:
             return "forward_hash"
+        stored_text_hash = message.get("forward_text_hash")
+        if (
+            forward_text_hash
+            and stored_text_hash
+            and stored_text_hash == forward_text_hash
+        ):
+            return "forward_text_hash"
         return None
 
     def _find_forward_match(
@@ -1026,15 +1037,17 @@ class MemoryRebootPlugin(Star):
         messages: List[Dict],
         forward_id: Optional[str],
         forward_hash: Optional[str],
+        forward_text_hash: Optional[str] = None,
         exclude_recent: int = 0,
     ) -> Tuple[Optional[Dict], int, Optional[str]]:
-        """优先按资源 ID、其次按稳定内容哈希查找相同合并转发。"""
+        """按资源ID、完整内容哈希、发送者+文本指纹依次查找。"""
         search_range = len(messages) - exclude_recent if exclude_recent > 0 else len(messages)
         for index in range(search_range):
             match_type = self._is_same_forward(
                 messages[index],
                 forward_id,
                 forward_hash,
+                forward_text_hash,
             )
             if match_type:
                 return messages[index], index, match_type
@@ -1045,11 +1058,17 @@ class MemoryRebootPlugin(Star):
         messages: List[Dict],
         forward_id: Optional[str],
         forward_hash: Optional[str],
+        forward_text_hash: Optional[str] = None,
     ) -> Tuple[int, List[str]]:
-        """统计发送同一合并转发资源或相同内容的不同用户。"""
+        """统计发送同一转发ID或精确内容指纹的不同用户。"""
         sender_ids = set()
         for message in messages:
-            if not self._is_same_forward(message, forward_id, forward_hash):
+            if not self._is_same_forward(
+                message,
+                forward_id,
+                forward_hash,
+                forward_text_hash,
+            ):
                 continue
             sender_id = message.get("sender_id")
             if sender_id:
@@ -1798,7 +1817,15 @@ class MemoryRebootPlugin(Star):
 
     def _is_forward_debug_enabled(self) -> bool:
         """读取转发指纹诊断开关，并兼容字符串形式的布尔值。"""
-        enabled = self.config.get("forward_debug_log", False)
+        return self._get_bool_config("forward_debug_log", False)
+
+    def _is_forward_sender_text_match_enabled(self) -> bool:
+        """读取发送者ID+文本精确匹配开关。"""
+        return self._get_bool_config("forward_sender_text_match", True)
+
+    def _get_bool_config(self, key: str, default: bool) -> bool:
+        """读取布尔配置，并兼容字符串形式。"""
+        enabled = self.config.get(key, default)
         if isinstance(enabled, str):
             return enabled.strip().lower() in ("1", "true", "yes", "on")
         return bool(enabled)
@@ -1813,12 +1840,40 @@ class MemoryRebootPlugin(Star):
             separators=(",", ":"),
         )
 
+    @staticmethod
+    def _build_forward_sender_text_nodes(
+        canonical_nodes: List[Dict],
+    ) -> Tuple[List[Dict], int]:
+        """仅保留节点顺序、发送者ID和文本，并统计含文本节点数。"""
+        sender_text_nodes = []
+        text_node_count = 0
+        for node in canonical_nodes:
+            texts = [
+                segment.get("text")
+                for segment in node.get("segments", [])
+                if isinstance(segment, dict)
+                and isinstance(segment.get("text"), str)
+                and segment["text"]
+            ]
+            if texts:
+                text_node_count += 1
+            sender_text_nodes.append(
+                {
+                    "sender_id": node.get("sender_id", ""),
+                    "texts": texts,
+                }
+            )
+        return sender_text_nodes, text_node_count
+
     def _log_forward_debug(
         self,
         forward_id: str,
         canonical_nodes: List[Dict],
         state: Dict,
         forward_hash: Optional[str],
+        forward_text_hash: Optional[str],
+        sender_text_nodes: List[Dict],
+        text_node_count: int,
         has_enough_visible_content: bool,
     ) -> None:
         """分段输出内容指纹的完整规范化输入，便于对比两次转发。"""
@@ -1834,6 +1889,17 @@ class MemoryRebootPlugin(Star):
         else:
             hash_status = "generated"
 
+        if not self._is_forward_sender_text_match_enabled():
+            text_hash_status = "disabled"
+        elif not state["complete"]:
+            text_hash_status = "incomplete"
+        elif state["visible_chars"] < DEFAULT_FORWARD_TEXT_MATCH_MIN_CHARS:
+            text_hash_status = "insufficient_chars"
+        elif text_node_count < DEFAULT_FORWARD_TEXT_MATCH_MIN_NODES:
+            text_hash_status = "insufficient_text_nodes"
+        else:
+            text_hash_status = "generated"
+
         node_hashes = [
             hashlib.sha256(
                 self._serialize_forward_value(node).encode("utf-8")
@@ -1845,6 +1911,8 @@ class MemoryRebootPlugin(Star):
             "hash_version": FORWARD_HASH_VERSION,
             "forward_hash": forward_hash,
             "hash_status": hash_status,
+            "forward_text_hash": forward_text_hash,
+            "text_hash_status": text_hash_status,
             "limits": state["limits"],
             "stats": {
                 "fetches": state["fetches"],
@@ -1852,12 +1920,14 @@ class MemoryRebootPlugin(Star):
                 "segments": state["segments"],
                 "chars": state["chars"],
                 "visible_chars": state["visible_chars"],
+                "text_nodes": text_node_count,
                 "stable_media": state["stable_media"],
                 "unreadable_forwards": state["unreadable_forwards"],
                 "complete": state["complete"],
             },
             "canonical_node_hashes": node_hashes,
             "canonical_nodes": canonical_nodes,
+            "sender_text_nodes": sender_text_nodes,
         }
         serialized = self._serialize_forward_value(payload)
         chunk_size = 1800
@@ -1884,9 +1954,16 @@ class MemoryRebootPlugin(Star):
     ) -> Dict:
         """展开合并转发并生成内容哈希；相同 ID 优先复用历史结果。"""
         debug_enabled = self._is_forward_debug_enabled()
+        sender_text_match_enabled = self._is_forward_sender_text_match_enabled()
+        known_text_hash_ready = (
+            not sender_text_match_enabled
+            or bool((known_message or {}).get("forward_text_hash"))
+            or (known_message or {}).get("forward_text_hash_eligible") is False
+        )
         can_reuse_known = (
             known_message is not None
             and not debug_enabled
+            and known_text_hash_ready
             and known_message.get("forward_hash_version") == FORWARD_HASH_VERSION
             and (
                 known_message.get("forward_hash")
@@ -1901,6 +1978,15 @@ class MemoryRebootPlugin(Star):
                     or "[合并转发消息]"
                 ),
                 "forward_hash": known_message.get("forward_hash"),
+                "forward_text_hash": (
+                    known_message.get("forward_text_hash")
+                    if sender_text_match_enabled
+                    else None
+                ),
+                "forward_text_hash_eligible": known_message.get(
+                    "forward_text_hash_eligible",
+                    False,
+                ),
                 "forward_node_count": known_message.get("forward_node_count", 0),
                 "forward_truncated": known_message.get("forward_truncated", False),
                 "forward_partial": known_message.get("forward_partial", False),
@@ -1937,6 +2023,9 @@ class MemoryRebootPlugin(Star):
 
         forward_hash = None
         canonical_nodes = expanded["canonical_nodes"]
+        sender_text_nodes, text_node_count = (
+            self._build_forward_sender_text_nodes(canonical_nodes)
+        )
         has_unreadable = state["unreadable_forwards"] > 0
         has_enough_visible_content = (
             not has_unreadable
@@ -1947,11 +2036,26 @@ class MemoryRebootPlugin(Star):
             serialized = self._serialize_forward_value(canonical_nodes)
             forward_hash = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
+        forward_text_hash = None
+        text_hash_eligible = (
+            state["complete"]
+            and state["visible_chars"] >= DEFAULT_FORWARD_TEXT_MATCH_MIN_CHARS
+            and text_node_count >= DEFAULT_FORWARD_TEXT_MATCH_MIN_NODES
+        )
+        if sender_text_match_enabled and text_hash_eligible:
+            serialized_text = self._serialize_forward_value(sender_text_nodes)
+            forward_text_hash = hashlib.sha256(
+                serialized_text.encode("utf-8")
+            ).hexdigest()
+
         self._log_forward_debug(
             forward_id,
             canonical_nodes,
             state,
             forward_hash,
+            forward_text_hash,
+            sender_text_nodes,
+            text_node_count,
             has_enough_visible_content,
         )
 
@@ -1960,13 +2064,17 @@ class MemoryRebootPlugin(Star):
             f"层数上限={state['limits']['depth']}, 拉取={state['fetches']}, "
             f"节点={state['nodes']}, 消息段={state['segments']}, "
             f"字符={state['chars']}, 可见正文={state['visible_chars']}, "
+            f"文本节点={text_node_count}, "
             f"稳定媒体={state['stable_media']}, "
             f"不可读内层={state['unreadable_forwards']}, "
-            f"内容指纹={'已生成' if forward_hash else '未生成'}"
+            f"内容指纹={'已生成' if forward_hash else '未生成'}, "
+            f"发送者+文本指纹={'已生成' if forward_text_hash else '未生成'}"
         )
         return {
             "forward_content": forward_content,
             "forward_hash": forward_hash,
+            "forward_text_hash": forward_text_hash,
+            "forward_text_hash_eligible": text_hash_eligible,
             "forward_node_count": state["nodes"],
             "forward_truncated": not state["complete"],
             "forward_partial": has_unreadable,
@@ -2107,6 +2215,10 @@ class MemoryRebootPlugin(Star):
                 "has_image": forward_data["has_image"],
                 "forward_id": forward_id,
                 "forward_hash": forward_data["forward_hash"],
+                "forward_text_hash": forward_data["forward_text_hash"],
+                "forward_text_hash_eligible": forward_data[
+                    "forward_text_hash_eligible"
+                ],
                 "forward_content": forward_content,
                 "forward_node_count": forward_data["forward_node_count"],
                 "forward_truncated": forward_data["forward_truncated"],
@@ -2167,6 +2279,7 @@ class MemoryRebootPlugin(Star):
         image_source = result.get("image_source")
         forward_id = result.get("forward_id")
         forward_hash = result.get("forward_hash")
+        forward_text_hash = result.get("forward_text_hash")
         forward_truncated = result.get("forward_truncated", False)
         forward_partial = result.get("forward_partial", False)
 
@@ -2208,12 +2321,14 @@ class MemoryRebootPlugin(Star):
             messages,
             forward_id,
             forward_hash,
+            forward_text_hash,
         )
         if forward_id:
             logger.info(
                 f"[Memory Reboot] 合并转发匹配: "
                 f"{forward_match_type or '未命中'} "
-                f"(内容哈希={'有' if forward_hash else '无'})"
+                f"(内容哈希={'有' if forward_hash else '无'}, "
+                f"发送者+文本指纹={'有' if forward_text_hash else '无'})"
             )
 
         # 精确命中的转发无需再次生成embedding；未完整或含不可读内层
@@ -2242,6 +2357,11 @@ class MemoryRebootPlugin(Star):
             "image_hash": image_hash,
             "forward_id": forward_id,
             "forward_hash": forward_hash,
+            "forward_text_hash": forward_text_hash,
+            "forward_text_hash_eligible": result.get(
+                "forward_text_hash_eligible",
+                False,
+            ),
             "forward_content": result.get("forward_content"),
             "forward_node_count": result.get("forward_node_count", 0),
             "forward_truncated": forward_truncated,
@@ -2273,7 +2393,11 @@ class MemoryRebootPlugin(Star):
                 matched_msg, matched_idx, match_type = img_matched, img_idx, "image_hash"
             elif (
                 matched_msg
-                and match_type not in ("forward_id", "forward_hash")
+                and match_type not in (
+                    "forward_id",
+                    "forward_hash",
+                    "forward_text_hash",
+                )
                 and img_matched
                 and img_matched.get("timestamp", 0) < matched_msg.get("timestamp", 0)
             ):
@@ -2286,11 +2410,12 @@ class MemoryRebootPlugin(Star):
         
         # 人数检测（使用包含当前消息的列表）
         min_unique_senders = self.config.get("min_unique_senders", 3)
-        if match_type in ("forward_id", "forward_hash"):
+        if match_type in ("forward_id", "forward_hash", "forward_text_hash"):
             unique_count, sender_list = self._count_unique_senders_by_forward(
                 messages_with_current,
                 forward_id,
                 forward_hash,
+                forward_text_hash,
             )
             logger.debug(
                 f"[Memory Reboot] 人数检测(合并转发): "
@@ -2404,7 +2529,7 @@ class MemoryRebootPlugin(Star):
 📊 消息数: {len(messages)}
 🧠 含embedding: {sum(1 for m in messages if m.get("embedding"))}
 🖼️ 含图片: {sum(1 for m in messages if m.get("has_image"))} (含哈希: {sum(1 for m in messages if m.get("image_hash"))})
-📨 合并转发: {sum(1 for m in messages if m.get("forward_id"))} (含内容哈希: {sum(1 for m in messages if m.get("forward_hash"))} / 部分可见: {sum(1 for m in messages if m.get("forward_partial"))})
+📨 合并转发: {sum(1 for m in messages if m.get("forward_id"))} (完整哈希: {sum(1 for m in messages if m.get("forward_hash"))} / 发送者+文本: {sum(1 for m in messages if m.get("forward_text_hash"))} / 部分可见: {sum(1 for m in messages if m.get("forward_partial"))})
 
 ⚙️ 配置参数:
 📏 文本相似度阈值: {self.config.get('similarity_threshold', DEFAULT_SIMILARITY_THRESHOLD)}
@@ -2415,6 +2540,7 @@ class MemoryRebootPlugin(Star):
 🧵 转发展开: 深度{forward_limits['depth']} / 拉取{forward_limits['fetches']}次 / 单次超时{forward_limits['timeout']}秒 / 节点{forward_limits['nodes']}条
 🧱 转发内容: 消息段{forward_limits['segments']}个 / 字符{forward_limits['chars']}个
 👁️ 部分可见哈希: 至少{forward_limits['visible_chars']}个正文字符，或包含稳定媒体标识
+📝 发送者+文本匹配: {'✅ 已开启（至少20字且2个文本节点）' if self._is_forward_sender_text_match_enabled() else '❌ 已关闭'}
 🧪 转发指纹诊断: {'⚠️ 已开启（日志含聊天内容）' if self._is_forward_debug_enabled() else '❌ 已关闭'}
 
 🛠️ 环境检查:
