@@ -118,6 +118,7 @@ class MemoryRebootPlugin(Star):
         - forward_fetch_timeout: 单次调用get_forward_msg超时秒数
         - forward_max_nodes/segments/chars: 合并转发处理规模上限
         - forward_min_visible_chars: 内层不可读时生成哈希所需可见正文长度
+        - forward_debug_log: 临时输出完整的转发指纹诊断日志
     
     性能优化:
         - 内存缓存: 消息列表缓存在内存中，避免每次从磁盘加载
@@ -1795,6 +1796,86 @@ class MemoryRebootPlugin(Star):
         finally:
             state["active_ids"].discard(forward_id)
 
+    def _is_forward_debug_enabled(self) -> bool:
+        """读取转发指纹诊断开关，并兼容字符串形式的布尔值。"""
+        enabled = self.config.get("forward_debug_log", False)
+        if isinstance(enabled, str):
+            return enabled.strip().lower() in ("1", "true", "yes", "on")
+        return bool(enabled)
+
+    @staticmethod
+    def _serialize_forward_value(value) -> str:
+        """使用内容指纹统一的规则序列化规范化数据。"""
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    def _log_forward_debug(
+        self,
+        forward_id: str,
+        canonical_nodes: List[Dict],
+        state: Dict,
+        forward_hash: Optional[str],
+        has_enough_visible_content: bool,
+    ) -> None:
+        """分段输出内容指纹的完整规范化输入，便于对比两次转发。"""
+        if not self._is_forward_debug_enabled():
+            return
+
+        if not state["complete"]:
+            hash_status = "incomplete"
+        elif not canonical_nodes:
+            hash_status = "no_nodes"
+        elif not has_enough_visible_content:
+            hash_status = "insufficient_visible_content"
+        else:
+            hash_status = "generated"
+
+        node_hashes = [
+            hashlib.sha256(
+                self._serialize_forward_value(node).encode("utf-8")
+            ).hexdigest()
+            for node in canonical_nodes
+        ]
+        payload = {
+            "forward_id": forward_id,
+            "hash_version": FORWARD_HASH_VERSION,
+            "forward_hash": forward_hash,
+            "hash_status": hash_status,
+            "limits": state["limits"],
+            "stats": {
+                "fetches": state["fetches"],
+                "nodes": state["nodes"],
+                "segments": state["segments"],
+                "chars": state["chars"],
+                "visible_chars": state["visible_chars"],
+                "stable_media": state["stable_media"],
+                "unreadable_forwards": state["unreadable_forwards"],
+                "complete": state["complete"],
+            },
+            "canonical_node_hashes": node_hashes,
+            "canonical_nodes": canonical_nodes,
+        }
+        serialized = self._serialize_forward_value(payload)
+        chunk_size = 1800
+        total_chunks = max(1, (len(serialized) + chunk_size - 1) // chunk_size)
+
+        logger.warning(
+            "[Memory Reboot][ForwardDebug] 诊断已启用；以下日志包含"
+            f"聊天正文和发送者信息。id={forward_id}, 分段={total_chunks}"
+        )
+        for index in range(total_chunks):
+            start = index * chunk_size
+            chunk = serialized[start:start + chunk_size]
+            logger.info(
+                f"[Memory Reboot][ForwardDebug] id={forward_id} "
+                f"part={index + 1}/{total_chunks} data={chunk}"
+            )
+        logger.info(f"[Memory Reboot][ForwardDebug] id={forward_id} END")
+
     async def _extract_forward_content(
         self,
         event: AstrMessageEvent,
@@ -1802,8 +1883,10 @@ class MemoryRebootPlugin(Star):
         known_message: Optional[Dict] = None,
     ) -> Dict:
         """展开合并转发并生成内容哈希；相同 ID 优先复用历史结果。"""
+        debug_enabled = self._is_forward_debug_enabled()
         can_reuse_known = (
             known_message is not None
+            and not debug_enabled
             and known_message.get("forward_hash_version") == FORWARD_HASH_VERSION
             and (
                 known_message.get("forward_hash")
@@ -1826,9 +1909,8 @@ class MemoryRebootPlugin(Star):
                 "reused": True,
             }
         if known_message is not None:
-            logger.info(
-                "[Memory Reboot] 历史转发指纹需要升级或重新生成"
-            )
+            reason = "诊断已开启" if debug_enabled else "指纹需要升级或重新生成"
+            logger.info(f"[Memory Reboot] 历史转发记录不复用: {reason}")
 
         state = {
             "limits": self._get_forward_limits(),
@@ -1862,13 +1944,16 @@ class MemoryRebootPlugin(Star):
             or state["stable_media"] > 0
         )
         if state["complete"] and canonical_nodes and has_enough_visible_content:
-            serialized = json.dumps(
-                canonical_nodes,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
+            serialized = self._serialize_forward_value(canonical_nodes)
             forward_hash = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+        self._log_forward_debug(
+            forward_id,
+            canonical_nodes,
+            state,
+            forward_hash,
+            has_enough_visible_content,
+        )
 
         logger.info(
             f"[Memory Reboot] 合并转发展开: id={forward_id}, "
@@ -2330,6 +2415,7 @@ class MemoryRebootPlugin(Star):
 🧵 转发展开: 深度{forward_limits['depth']} / 拉取{forward_limits['fetches']}次 / 单次超时{forward_limits['timeout']}秒 / 节点{forward_limits['nodes']}条
 🧱 转发内容: 消息段{forward_limits['segments']}个 / 字符{forward_limits['chars']}个
 👁️ 部分可见哈希: 至少{forward_limits['visible_chars']}个正文字符，或包含稳定媒体标识
+🧪 转发指纹诊断: {'⚠️ 已开启（日志含聊天内容）' if self._is_forward_debug_enabled() else '❌ 已关闭'}
 
 🛠️ 环境检查:
 - Pillow库: {'✅ 已安装 (dHash可用)' if HAS_PIL else '❌ 未安装 (降级为MD5)'}
