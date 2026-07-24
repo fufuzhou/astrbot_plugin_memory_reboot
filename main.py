@@ -1348,13 +1348,28 @@ class MemoryRebootPlugin(Star):
                 return nodes
         return None
 
+    @staticmethod
+    def _is_unavailable_forward_error(error: Exception) -> bool:
+        """判断转发资源是否已过期或属于协议端禁止读取的内层消息。"""
+        message = str(error).lower()
+        unavailable_markers = (
+            "消息已过期",
+            "内层消息",
+            "message expired",
+            "expired message",
+            "inner message",
+        )
+        return any(marker in message for marker in unavailable_markers)
+
     async def _fetch_forward_payload(
         self,
         event: AstrMessageEvent,
         forward_id: str,
         state: Dict,
+        is_nested: bool = False,
     ) -> Optional[Dict]:
         """通过 OneBot get_forward_msg 拉取合并转发内容。"""
+        state["can_use_opaque_forward_id"] = False
         bot = getattr(event, "bot", None)
         call_action = getattr(bot, "call_action", None)
         if not callable(call_action):
@@ -1373,6 +1388,7 @@ class MemoryRebootPlugin(Star):
             routing_params["self_id"] = self_id
 
         last_error = None
+        permanently_unavailable = False
         # OneBot v11标准参数是id；message_id仅作为少数实现的兼容回退。
         for key in ("id", "message_id"):
             for value in values:
@@ -1398,13 +1414,27 @@ class MemoryRebootPlugin(Star):
                     break
                 except Exception as e:
                     last_error = e
-            if isinstance(last_error, asyncio.TimeoutError):
+                    if self._is_unavailable_forward_error(e):
+                        permanently_unavailable = True
+                        break
+            if isinstance(last_error, asyncio.TimeoutError) or permanently_unavailable:
                 break
 
-        error_text = f": {type(last_error).__name__}: {last_error}" if last_error else ""
-        logger.warning(
-            f"[Memory Reboot] 无法展开合并转发 id={forward_id}{error_text}"
+        error_text = (
+            f": {type(last_error).__name__}: {last_error}"
+            if last_error
+            else ""
         )
+        if is_nested and permanently_unavailable:
+            state["can_use_opaque_forward_id"] = True
+            logger.info(
+                f"[Memory Reboot] 内层合并转发无法继续展开，"
+                f"改用转发ID参与内容指纹: id={forward_id}"
+            )
+        else:
+            logger.warning(
+                f"[Memory Reboot] 无法展开合并转发 id={forward_id}{error_text}"
+            )
         return None
 
     def _stable_forward_media_key(
@@ -1548,6 +1578,11 @@ class MemoryRebootPlugin(Star):
                 depth + 1,
                 state,
             )
+            if nested.get("opaque_id"):
+                return {
+                    "type": "forward",
+                    "opaque_id": nested["opaque_id"],
+                }, "[内层转发：仅记录ID]"
             nested_text = "\n".join(nested["display_lines"])
             display = "[嵌套转发]"
             if nested_text:
@@ -1627,7 +1662,29 @@ class MemoryRebootPlugin(Star):
 
         state["active_ids"].add(forward_id)
         try:
-            payload = await self._fetch_forward_payload(event, forward_id, state)
+            payload = await self._fetch_forward_payload(
+                event,
+                forward_id,
+                state,
+                is_nested=depth > 1,
+            )
+            can_use_opaque_id = (
+                payload is None
+                and depth > 1
+                and state["complete"]
+                and state.get("can_use_opaque_forward_id", False)
+            )
+            if can_use_opaque_id:
+                # OneBot实现通常不允许再次读取内层转发。保留其ID作为
+                # 不透明内容标识，宁可在ID变化时漏报，也不因残缺内容误报。
+                state["opaque_forwards"] = state.get("opaque_forwards", 0) + 1
+                result = {
+                    "canonical_nodes": [],
+                    "display_lines": ["[内层转发：仅记录ID]"],
+                    "opaque_id": forward_id,
+                }
+                state["cache"][cache_key] = result
+                return result
             nodes = self._get_forward_nodes(payload)
             if nodes is None:
                 state["complete"] = False
@@ -1753,6 +1810,7 @@ class MemoryRebootPlugin(Star):
             "complete": True,
             "halted": False,
             "has_image": False,
+            "opaque_forwards": 0,
             "active_ids": set(),
             "cache": {},
         }
@@ -1779,7 +1837,8 @@ class MemoryRebootPlugin(Star):
             f"[Memory Reboot] 合并转发展开: id={forward_id}, "
             f"层数上限={state['limits']['depth']}, 拉取={state['fetches']}, "
             f"节点={state['nodes']}, 消息段={state['segments']}, "
-            f"字符={state['chars']}, 完整={'是' if state['complete'] else '否'}"
+            f"字符={state['chars']}, 内层ID替代={state['opaque_forwards']}, "
+            f"内容指纹={'已生成' if forward_hash else '未生成'}"
         )
         return {
             "forward_content": forward_content,
