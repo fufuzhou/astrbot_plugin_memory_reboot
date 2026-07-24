@@ -1215,8 +1215,40 @@ class MemoryRebootPlugin(Star):
             logger.error(f"[Memory Reboot] LLM判断异常: {e}")
         return False
     
-    async def _send_reminder(self, event: AstrMessageEvent):
-        """发送提醒消息（使用引用回复形式）"""
+    def _build_message_summary(self, matched_msg: Dict) -> str:
+        """生成匹配到的历史消息摘要。"""
+        sender_name = str(matched_msg.get("sender_name") or "未知")
+
+        timestamp = matched_msg.get("timestamp", 0)
+        try:
+            timestamp = float(timestamp)
+            if timestamp <= 0:
+                raise ValueError("无效时间戳")
+            time_text = (
+                f"{self._format_time(timestamp)}"
+                f"（{self._format_time_ago(timestamp)}）"
+            )
+        except (TypeError, ValueError, OverflowError, OSError):
+            time_text = "未知"
+
+        content = re.sub(r"\s+", " ", str(matched_msg.get("content") or "")).strip()
+        if not content:
+            content = "（无文字内容）"
+        elif len(content) > 200:
+            content = content[:200].rstrip() + "…"
+
+        lines = [
+            "\n\n📌 之前的消息摘要",
+            f"发送者：{sender_name}",
+            f"时间：{time_text}",
+            f"内容：{content}",
+        ]
+        if matched_msg.get("has_image"):
+            lines.append("附件：包含图片")
+        return "\n".join(lines)
+
+    async def _send_reminder(self, event: AstrMessageEvent, matched_msg: Dict):
+        """发送提醒图片，并附上匹配到的历史消息摘要。"""
         # 尝试获取消息ID用于引用回复
         msg_id = None
         try:
@@ -1234,6 +1266,7 @@ class MemoryRebootPlugin(Star):
             chain.append(Image.fromFileSystem(img_path))
         else:
             chain.append(Plain("这个话题之前已经有人讨论过了哦~"))
+        chain.append(Plain(self._build_message_summary(matched_msg)))
         yield event.chain_result(chain)
     
     async def _extract_content(self, event: AstrMessageEvent) -> Optional[Tuple[str, Optional[str]]]:
@@ -1426,7 +1459,7 @@ class MemoryRebootPlugin(Star):
 
         if should_remind:
             logger.info(f"[Memory Reboot] 最终判断: 触发提醒 -> {sender_name}")
-            async for result in self._send_reminder(event):
+            async for result in self._send_reminder(event, matched_msg):
                 yield result
         else:
             logger.info(f"[Memory Reboot] 最终判断: 不提醒")
