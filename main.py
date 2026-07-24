@@ -81,6 +81,8 @@ DEFAULT_FORWARD_FETCH_TIMEOUT = 10        # 单次拉取转发资源超时（秒
 DEFAULT_FORWARD_MAX_NODES = 100           # 单条消息最多处理转发节点数
 DEFAULT_FORWARD_MAX_SEGMENTS = 500        # 单条消息最多处理消息段数
 DEFAULT_FORWARD_MAX_CHARS = 12000         # 单条消息最多提取文本字符数
+DEFAULT_FORWARD_MIN_VISIBLE_CHARS = 20    # 含不可读内层转发时最少可见正文字符数
+FORWARD_HASH_VERSION = 2                  # 转发内容指纹算法版本
 REMINDER_IMAGE_FILENAME = "1000101866.jpg" # 提醒图片文件名
 
 
@@ -115,6 +117,7 @@ class MemoryRebootPlugin(Star):
         - forward_max_fetches: 单条消息最多调用get_forward_msg次数
         - forward_fetch_timeout: 单次调用get_forward_msg超时秒数
         - forward_max_nodes/segments/chars: 合并转发处理规模上限
+        - forward_min_visible_chars: 内层不可读时生成哈希所需可见正文长度
     
     性能优化:
         - 内存缓存: 消息列表缓存在内存中，避免每次从磁盘加载
@@ -1305,6 +1308,11 @@ class MemoryRebootPlugin(Star):
                 50000,
                 minimum=500,
             ),
+            "visible_chars": read_limit(
+                "forward_min_visible_chars",
+                DEFAULT_FORWARD_MIN_VISIBLE_CHARS,
+                200,
+            ),
         }
 
     @staticmethod
@@ -1369,7 +1377,7 @@ class MemoryRebootPlugin(Star):
         is_nested: bool = False,
     ) -> Optional[Dict]:
         """通过 OneBot get_forward_msg 拉取合并转发内容。"""
-        state["can_use_opaque_forward_id"] = False
+        state["is_unreadable_nested_forward"] = False
         bot = getattr(event, "bot", None)
         call_action = getattr(bot, "call_action", None)
         if not callable(call_action):
@@ -1426,10 +1434,10 @@ class MemoryRebootPlugin(Star):
             else ""
         )
         if is_nested and permanently_unavailable:
-            state["can_use_opaque_forward_id"] = True
+            state["is_unreadable_nested_forward"] = True
             logger.info(
                 f"[Memory Reboot] 内层合并转发无法继续展开，"
-                f"改用转发ID参与内容指纹: id={forward_id}"
+                f"改用稳定占位符参与外层内容指纹: id={forward_id}"
             )
         else:
             logger.warning(
@@ -1541,10 +1549,12 @@ class MemoryRebootPlugin(Star):
         if isinstance(segment, str):
             text = self._normalize_forward_text(segment)
             text = self._take_forward_text(state, text)
+            state["visible_chars"] += len(text)
             return {"type": "text", "text": text}, text
         if not isinstance(segment, dict):
             text = self._normalize_forward_text(segment)
             text = self._take_forward_text(state, text)
+            state["visible_chars"] += len(text)
             return {"type": "unknown", "text": text}, text
 
         segment_type = str(segment.get("type") or "unknown").lower()
@@ -1557,6 +1567,7 @@ class MemoryRebootPlugin(Star):
                 data.get("text") or data.get("content")
             )
             text = self._take_forward_text(state, text)
+            state["visible_chars"] += len(text)
             return {"type": "text", "text": text}, text
 
         if segment_type == "forward":
@@ -1578,11 +1589,11 @@ class MemoryRebootPlugin(Star):
                 depth + 1,
                 state,
             )
-            if nested.get("opaque_id"):
+            if nested.get("unreadable"):
                 return {
                     "type": "forward",
-                    "opaque_id": nested["opaque_id"],
-                }, "[内层转发：仅记录ID]"
+                    "unreadable": True,
+                }, "[内层转发：内容不可读取]"
             nested_text = "\n".join(nested["display_lines"])
             display = "[嵌套转发]"
             if nested_text:
@@ -1598,6 +1609,8 @@ class MemoryRebootPlugin(Star):
             if not media_key:
                 state["complete"] = False
                 media_key = "unknown"
+            else:
+                state["stable_media"] += 1
             return {"type": "image", "key": media_key}, "[图片]"
 
         if segment_type in ("record", "video", "file"):
@@ -1605,6 +1618,8 @@ class MemoryRebootPlugin(Star):
             if not media_key:
                 state["complete"] = False
                 media_key = "unknown"
+            else:
+                state["stable_media"] += 1
             labels = {"record": "语音", "video": "视频", "file": "文件"}
             return {
                 "type": segment_type,
@@ -1668,20 +1683,20 @@ class MemoryRebootPlugin(Star):
                 state,
                 is_nested=depth > 1,
             )
-            can_use_opaque_id = (
+            can_use_placeholder = (
                 payload is None
                 and depth > 1
                 and state["complete"]
-                and state.get("can_use_opaque_forward_id", False)
+                and state.get("is_unreadable_nested_forward", False)
             )
-            if can_use_opaque_id:
-                # OneBot实现通常不允许再次读取内层转发。保留其ID作为
-                # 不透明内容标识，宁可在ID变化时漏报，也不因残缺内容误报。
-                state["opaque_forwards"] = state.get("opaque_forwards", 0) + 1
+            if can_use_placeholder:
+                # 协议端不提供内层内容，且其ID并不稳定。因此仅保留一个
+                # 固定占位符，并在最终生成哈希前检查外层可见内容是否充足。
+                state["unreadable_forwards"] += 1
                 result = {
                     "canonical_nodes": [],
-                    "display_lines": ["[内层转发：仅记录ID]"],
-                    "opaque_id": forward_id,
+                    "display_lines": ["[内层转发：内容不可读取]"],
+                    "unreadable": True,
                 }
                 state["cache"][cache_key] = result
                 return result
@@ -1789,6 +1804,7 @@ class MemoryRebootPlugin(Star):
         """展开合并转发并生成内容哈希；相同 ID 优先复用历史结果。"""
         can_reuse_known = (
             known_message is not None
+            and known_message.get("forward_hash_version") == FORWARD_HASH_VERSION
             and (
                 known_message.get("forward_hash")
                 or not known_message.get("forward_truncated", False)
@@ -1804,12 +1820,14 @@ class MemoryRebootPlugin(Star):
                 "forward_hash": known_message.get("forward_hash"),
                 "forward_node_count": known_message.get("forward_node_count", 0),
                 "forward_truncated": known_message.get("forward_truncated", False),
+                "forward_partial": known_message.get("forward_partial", False),
+                "forward_hash_version": FORWARD_HASH_VERSION,
                 "has_image": known_message.get("has_image", False),
                 "reused": True,
             }
         if known_message is not None:
             logger.info(
-                "[Memory Reboot] 历史转发记录未完整展开，重新尝试生成内容指纹"
+                "[Memory Reboot] 历史转发指纹需要升级或重新生成"
             )
 
         state = {
@@ -1821,7 +1839,9 @@ class MemoryRebootPlugin(Star):
             "complete": True,
             "halted": False,
             "has_image": False,
-            "opaque_forwards": 0,
+            "visible_chars": 0,
+            "stable_media": 0,
+            "unreadable_forwards": 0,
             "active_ids": set(),
             "cache": {},
         }
@@ -1835,7 +1855,13 @@ class MemoryRebootPlugin(Star):
 
         forward_hash = None
         canonical_nodes = expanded["canonical_nodes"]
-        if state["complete"] and canonical_nodes:
+        has_unreadable = state["unreadable_forwards"] > 0
+        has_enough_visible_content = (
+            not has_unreadable
+            or state["visible_chars"] >= state["limits"]["visible_chars"]
+            or state["stable_media"] > 0
+        )
+        if state["complete"] and canonical_nodes and has_enough_visible_content:
             serialized = json.dumps(
                 canonical_nodes,
                 ensure_ascii=False,
@@ -1848,7 +1874,9 @@ class MemoryRebootPlugin(Star):
             f"[Memory Reboot] 合并转发展开: id={forward_id}, "
             f"层数上限={state['limits']['depth']}, 拉取={state['fetches']}, "
             f"节点={state['nodes']}, 消息段={state['segments']}, "
-            f"字符={state['chars']}, 内层ID替代={state['opaque_forwards']}, "
+            f"字符={state['chars']}, 可见正文={state['visible_chars']}, "
+            f"稳定媒体={state['stable_media']}, "
+            f"不可读内层={state['unreadable_forwards']}, "
             f"内容指纹={'已生成' if forward_hash else '未生成'}"
         )
         return {
@@ -1856,6 +1884,8 @@ class MemoryRebootPlugin(Star):
             "forward_hash": forward_hash,
             "forward_node_count": state["nodes"],
             "forward_truncated": not state["complete"],
+            "forward_partial": has_unreadable,
+            "forward_hash_version": FORWARD_HASH_VERSION,
             "has_image": state["has_image"],
             "reused": False,
         }
@@ -1897,6 +1927,8 @@ class MemoryRebootPlugin(Star):
             lines.append(f"聊天节点：{matched_msg['forward_node_count']}条")
         if is_forward and matched_msg.get("forward_truncated"):
             lines.append("展开状态：内容未完整展开")
+        elif is_forward and matched_msg.get("forward_partial"):
+            lines.append("展开状态：内层不可读取，仅比较外层可见内容")
         if matched_msg.get("has_image"):
             lines.append("附件：包含图片")
         return "\n".join(lines)
@@ -1993,6 +2025,8 @@ class MemoryRebootPlugin(Star):
                 "forward_content": forward_content,
                 "forward_node_count": forward_data["forward_node_count"],
                 "forward_truncated": forward_data["forward_truncated"],
+                "forward_partial": forward_data["forward_partial"],
+                "forward_hash_version": forward_data["forward_hash_version"],
             }
 
         if image_sources:
@@ -2049,6 +2083,7 @@ class MemoryRebootPlugin(Star):
         forward_id = result.get("forward_id")
         forward_hash = result.get("forward_hash")
         forward_truncated = result.get("forward_truncated", False)
+        forward_partial = result.get("forward_partial", False)
 
         # 过滤：最小长度检查
         if not image_source and not forward_id:
@@ -2096,8 +2131,9 @@ class MemoryRebootPlugin(Star):
                 f"(内容哈希={'有' if forward_hash else '无'})"
             )
 
-        # 精确命中的转发无需再次生成embedding；未完整展开的内容也不参与语义匹配。
-        if forward_matched or forward_truncated:
+        # 精确命中的转发无需再次生成embedding；未完整或含不可读内层
+        # 的转发也不参与语义匹配，避免隐藏内容不同却被误判。
+        if forward_matched or forward_truncated or forward_partial:
             embedding = None
         else:
             embedding = await self._get_embedding(content)
@@ -2124,6 +2160,8 @@ class MemoryRebootPlugin(Star):
             "forward_content": result.get("forward_content"),
             "forward_node_count": result.get("forward_node_count", 0),
             "forward_truncated": forward_truncated,
+            "forward_partial": forward_partial,
+            "forward_hash_version": result.get("forward_hash_version"),
         }
         
         # 注意：此时不追加到 messages 列表，而是创建一个包含当前消息的临时列表用于匹配
@@ -2281,7 +2319,7 @@ class MemoryRebootPlugin(Star):
 📊 消息数: {len(messages)}
 🧠 含embedding: {sum(1 for m in messages if m.get("embedding"))}
 🖼️ 含图片: {sum(1 for m in messages if m.get("has_image"))} (含哈希: {sum(1 for m in messages if m.get("image_hash"))})
-📨 合并转发: {sum(1 for m in messages if m.get("forward_id"))} (含内容哈希: {sum(1 for m in messages if m.get("forward_hash"))})
+📨 合并转发: {sum(1 for m in messages if m.get("forward_id"))} (含内容哈希: {sum(1 for m in messages if m.get("forward_hash"))} / 部分可见: {sum(1 for m in messages if m.get("forward_partial"))})
 
 ⚙️ 配置参数:
 📏 文本相似度阈值: {self.config.get('similarity_threshold', DEFAULT_SIMILARITY_THRESHOLD)}
@@ -2291,6 +2329,7 @@ class MemoryRebootPlugin(Star):
 📅 数据保留: {self.config.get('data_retention_days', DEFAULT_DATA_RETENTION_DAYS)}天
 🧵 转发展开: 深度{forward_limits['depth']} / 拉取{forward_limits['fetches']}次 / 单次超时{forward_limits['timeout']}秒 / 节点{forward_limits['nodes']}条
 🧱 转发内容: 消息段{forward_limits['segments']}个 / 字符{forward_limits['chars']}个
+👁️ 部分可见哈希: 至少{forward_limits['visible_chars']}个正文字符，或包含稳定媒体标识
 
 🛠️ 环境检查:
 - Pillow库: {'✅ 已安装 (dHash可用)' if HAS_PIL else '❌ 未安装 (降级为MD5)'}
