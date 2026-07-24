@@ -1787,7 +1787,14 @@ class MemoryRebootPlugin(Star):
         known_message: Optional[Dict] = None,
     ) -> Dict:
         """展开合并转发并生成内容哈希；相同 ID 优先复用历史结果。"""
-        if known_message is not None:
+        can_reuse_known = (
+            known_message is not None
+            and (
+                known_message.get("forward_hash")
+                or not known_message.get("forward_truncated", False)
+            )
+        )
+        if can_reuse_known:
             return {
                 "forward_content": (
                     known_message.get("forward_content")
@@ -1800,6 +1807,10 @@ class MemoryRebootPlugin(Star):
                 "has_image": known_message.get("has_image", False),
                 "reused": True,
             }
+        if known_message is not None:
+            logger.info(
+                "[Memory Reboot] 历史转发记录未完整展开，重新尝试生成内容指纹"
+            )
 
         state = {
             "limits": self._get_forward_limits(),
