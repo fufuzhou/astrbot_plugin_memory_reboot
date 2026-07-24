@@ -62,6 +62,42 @@
     "hint": "消息记录保留多少天，超过此天数的记录会自动清理（默认7天）",
     "default": 7
   },
+  "forward_max_depth": {
+    "description": "合并转发最大展开层数",
+    "type": "int",
+    "hint": "限制嵌套合并转发的递归层数。默认3，插件内部硬上限为5。",
+    "default": 3
+  },
+  "forward_max_fetches": {
+    "description": "单条消息最多调用转发接口次数",
+    "type": "int",
+    "hint": "限制一次检测调用get_forward_msg的总次数。默认8，插件内部硬上限为20。",
+    "default": 8
+  },
+  "forward_fetch_timeout": {
+    "description": "单次拉取转发内容超时秒数",
+    "type": "int",
+    "hint": "单次get_forward_msg调用的超时时间。默认10秒，插件内部硬上限为30秒。",
+    "default": 10
+  },
+  "forward_max_nodes": {
+    "description": "单条消息最多处理转发节点数",
+    "type": "int",
+    "hint": "达到上限后停止处理，并禁用该条消息的内容哈希。默认100，插件内部硬上限为500。",
+    "default": 100
+  },
+  "forward_max_segments": {
+    "description": "单条消息最多处理消息段数",
+    "type": "int",
+    "hint": "限制转发节点内文字、图片等消息段总数。默认500，插件内部硬上限为2000。",
+    "default": 500
+  },
+  "forward_max_chars": {
+    "description": "单条转发最多提取字符数",
+    "type": "int",
+    "hint": "达到上限后停止提取，并禁用该条消息的内容哈希。默认12000，插件内部硬上限为50000。",
+    "default": 12000
+  },
   "vision_prompt": {
     "description": "图片识别提示词",
     "type": "text",

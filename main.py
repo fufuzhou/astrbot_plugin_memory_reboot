@@ -3,6 +3,7 @@
 # ==============================================================================
 
 # ----- 1.1 Python 标准库 -----
+import asyncio
 import os
 import re
 import json
@@ -13,7 +14,7 @@ import datetime
 import shutil
 import gzip
 from typing import Optional, List, Dict, Tuple
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 from urllib.request import url2pathname
 
 # ----- 1.2 第三方库（带依赖检查）-----
@@ -44,7 +45,7 @@ from astrbot.api import logger
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.event.filter import EventMessageType
 from astrbot.api.star import Context, Star, StarTools
-from astrbot.api.message_components import Plain, Image, Reply
+from astrbot.api.message_components import Plain, Image, Reply, Forward
 
 # ----- 1.4 插件命令过滤相关 -----
 try:
@@ -74,6 +75,12 @@ DEFAULT_IMAGE_HASH_THRESHOLD = 0.90       # 图片哈希相似度阈值（dHash 
 DEFAULT_MIN_UNIQUE_SENDERS = 3            # 最少不同发送者数量
 DEFAULT_COOLDOWN_SECONDS = 3600           # 冷却时间（秒）
 DEFAULT_MIN_TEXT_LENGTH = 2               # 最小文本长度
+DEFAULT_FORWARD_MAX_DEPTH = 3             # 合并转发最大展开层数
+DEFAULT_FORWARD_MAX_FETCHES = 8           # 单条消息最多调用get_forward_msg次数
+DEFAULT_FORWARD_FETCH_TIMEOUT = 10        # 单次拉取转发资源超时（秒）
+DEFAULT_FORWARD_MAX_NODES = 100           # 单条消息最多处理转发节点数
+DEFAULT_FORWARD_MAX_SEGMENTS = 500        # 单条消息最多处理消息段数
+DEFAULT_FORWARD_MAX_CHARS = 12000         # 单条消息最多提取文本字符数
 REMINDER_IMAGE_FILENAME = "1000101866.jpg" # 提醒图片文件名
 
 
@@ -104,6 +111,10 @@ class MemoryRebootPlugin(Star):
         - embedding_provider_id: Embedding模型提供商ID
         - vision_provider_id: 图片识别LLM的提供者ID
         - judge_provider_id: 判断LLM的提供者ID
+        - forward_max_depth: 合并转发最大展开层数
+        - forward_max_fetches: 单条消息最多调用get_forward_msg次数
+        - forward_fetch_timeout: 单次调用get_forward_msg超时秒数
+        - forward_max_nodes/segments/chars: 合并转发处理规模上限
     
     性能优化:
         - 内存缓存: 消息列表缓存在内存中，避免每次从磁盘加载
@@ -990,6 +1001,56 @@ class MemoryRebootPlugin(Star):
     # ==========================================================================
     # 4.7 相似度匹配方法
     # ==========================================================================
+
+    @staticmethod
+    def _is_same_forward(
+        message: Dict,
+        forward_id: Optional[str],
+        forward_hash: Optional[str],
+    ) -> Optional[str]:
+        """判断历史消息是否为同一合并转发，返回命中依据。"""
+        stored_id = message.get("forward_id")
+        if forward_id and stored_id and str(stored_id) == str(forward_id):
+            return "forward_id"
+        stored_hash = message.get("forward_hash")
+        if forward_hash and stored_hash and stored_hash == forward_hash:
+            return "forward_hash"
+        return None
+
+    def _find_forward_match(
+        self,
+        messages: List[Dict],
+        forward_id: Optional[str],
+        forward_hash: Optional[str],
+        exclude_recent: int = 0,
+    ) -> Tuple[Optional[Dict], int, Optional[str]]:
+        """优先按资源 ID、其次按稳定内容哈希查找相同合并转发。"""
+        search_range = len(messages) - exclude_recent if exclude_recent > 0 else len(messages)
+        for index in range(search_range):
+            match_type = self._is_same_forward(
+                messages[index],
+                forward_id,
+                forward_hash,
+            )
+            if match_type:
+                return messages[index], index, match_type
+        return None, -1, None
+
+    def _count_unique_senders_by_forward(
+        self,
+        messages: List[Dict],
+        forward_id: Optional[str],
+        forward_hash: Optional[str],
+    ) -> Tuple[int, List[str]]:
+        """统计发送同一合并转发资源或相同内容的不同用户。"""
+        sender_ids = set()
+        for message in messages:
+            if not self._is_same_forward(message, forward_id, forward_hash):
+                continue
+            sender_id = message.get("sender_id")
+            if sender_id:
+                sender_ids.add(sender_id)
+        return len(sender_ids), list(sender_ids)
     
     def _find_best_match(self, messages: List[Dict], embedding: List[float],
                          threshold: float, exclude_recent: int = 0) -> Tuple[Optional[Dict], int, float]:
@@ -1214,6 +1275,520 @@ class MemoryRebootPlugin(Star):
         except Exception as e:
             logger.error(f"[Memory Reboot] LLM判断异常: {e}")
         return False
+
+    def _get_forward_limits(self) -> Dict[str, int]:
+        """读取并限制合并转发的资源消耗上限。"""
+        def read_limit(key: str, default: int, hard_max: int, minimum: int = 1) -> int:
+            try:
+                value = int(self.config.get(key, default))
+            except (TypeError, ValueError):
+                value = default
+            return max(minimum, min(value, hard_max))
+
+        return {
+            "depth": read_limit("forward_max_depth", DEFAULT_FORWARD_MAX_DEPTH, 5),
+            "fetches": read_limit("forward_max_fetches", DEFAULT_FORWARD_MAX_FETCHES, 20),
+            "timeout": read_limit(
+                "forward_fetch_timeout",
+                DEFAULT_FORWARD_FETCH_TIMEOUT,
+                30,
+            ),
+            "nodes": read_limit("forward_max_nodes", DEFAULT_FORWARD_MAX_NODES, 500),
+            "segments": read_limit(
+                "forward_max_segments",
+                DEFAULT_FORWARD_MAX_SEGMENTS,
+                2000,
+            ),
+            "chars": read_limit(
+                "forward_max_chars",
+                DEFAULT_FORWARD_MAX_CHARS,
+                50000,
+                minimum=500,
+            ),
+        }
+
+    @staticmethod
+    def _normalize_forward_text(value) -> str:
+        """标准化转发节点中的文本，避免无意义的空白差异。"""
+        return re.sub(r"\s+", " ", str(value or "")).strip()
+
+    @staticmethod
+    def _take_forward_text(state: Dict, text: str) -> str:
+        """按总字符上限截取文本，并在截断时禁止生成内容哈希。"""
+        remaining = state["limits"]["chars"] - state["chars"]
+        if remaining <= 0:
+            state["complete"] = False
+            state["halted"] = True
+            return ""
+        if len(text) > remaining:
+            state["chars"] += remaining
+            state["complete"] = False
+            state["halted"] = True
+            return text[:remaining]
+        state["chars"] += len(text)
+        return text
+
+    @staticmethod
+    def _get_forward_nodes(payload) -> Optional[List[Dict]]:
+        """兼容 OneBot、NapCat 等实现的 get_forward_msg 返回结构。"""
+        if isinstance(payload, list):
+            return payload
+        if not isinstance(payload, dict):
+            return None
+
+        data = payload.get("data")
+        if isinstance(data, dict):
+            payload = data
+        elif isinstance(data, list):
+            return data
+
+        for key in ("messages", "message", "nodes", "nodeList"):
+            nodes = payload.get(key)
+            if isinstance(nodes, list):
+                return nodes
+        return None
+
+    async def _fetch_forward_payload(
+        self,
+        event: AstrMessageEvent,
+        forward_id: str,
+        state: Dict,
+    ) -> Optional[Dict]:
+        """通过 OneBot get_forward_msg 拉取合并转发内容。"""
+        bot = getattr(event, "bot", None)
+        call_action = getattr(bot, "call_action", None)
+        if not callable(call_action):
+            call_action = getattr(getattr(bot, "api", None), "call_action", None)
+        if not callable(call_action):
+            logger.warning("[Memory Reboot] 当前消息平台不支持 get_forward_msg")
+            return None
+
+        values = [forward_id]
+        if forward_id.isdigit():
+            values.append(int(forward_id))
+
+        routing_params = {}
+        self_id = getattr(getattr(event, "message_obj", None), "self_id", None)
+        if self_id:
+            routing_params["self_id"] = self_id
+
+        last_error = None
+        # OneBot v11标准参数是id；message_id仅作为少数实现的兼容回退。
+        for key in ("id", "message_id"):
+            for value in values:
+                if state["fetches"] >= state["limits"]["fetches"]:
+                    state["complete"] = False
+                    return None
+                state["fetches"] += 1
+                try:
+                    result = await asyncio.wait_for(
+                        call_action(
+                            "get_forward_msg",
+                            **{key: value},
+                            **routing_params,
+                        ),
+                        timeout=state["limits"]["timeout"],
+                    )
+                    if self._get_forward_nodes(result) is not None:
+                        return result
+                    last_error = ValueError("响应中没有转发节点")
+                except asyncio.TimeoutError as e:
+                    state["complete"] = False
+                    last_error = e
+                    break
+                except Exception as e:
+                    last_error = e
+            if isinstance(last_error, asyncio.TimeoutError):
+                break
+
+        error_text = f": {type(last_error).__name__}: {last_error}" if last_error else ""
+        logger.warning(
+            f"[Memory Reboot] 无法展开合并转发 id={forward_id}{error_text}"
+        )
+        return None
+
+    def _stable_forward_media_key(
+        self,
+        data: Dict,
+        allow_name: bool = True,
+    ) -> Optional[str]:
+        """提取图片、文件等媒体段中相对稳定的内容标识。"""
+        keys = ["md5", "file_uuid", "file_id", "file"]
+        if allow_name:
+            keys.append("name")
+        for key in keys:
+            value = data.get(key)
+            if value in (None, ""):
+                continue
+            value = str(value).strip()
+            if not value:
+                continue
+            if key == "file":
+                parsed = urlparse(value)
+                if parsed.scheme:
+                    query = {
+                        str(query_key).lower(): query_value
+                        for query_key, query_value in parse_qs(parsed.query).items()
+                    }
+                    stable_query = None
+                    for query_key in (
+                        "md5",
+                        "fileid",
+                        "file_id",
+                        "file_uuid",
+                        "uuid",
+                    ):
+                        query_value = query.get(query_key)
+                        if query_value:
+                            stable_query = f"{query_key}={query_value[0]}"
+                            break
+                    # 无法识别稳定查询参数时保留完整URL，宁可漏报也不误报。
+                    if stable_query:
+                        value = (
+                            f"{parsed.netloc}{unquote(parsed.path)}?"
+                            f"{stable_query}"
+                        )
+                else:
+                    value = value.split("?", 1)[0]
+            if len(value) > 512:
+                value = hashlib.sha256(value.encode("utf-8")).hexdigest()
+            return f"{key}:{value.lower()}"
+        return None
+
+    def _sanitize_forward_data(self, value, state: Dict, depth: int = 0):
+        """清理通用消息段中的临时字段，生成可稳定序列化的数据。"""
+        if depth > 4:
+            state["complete"] = False
+            return "[data-depth-limit]"
+        if isinstance(value, dict):
+            volatile_keys = {
+                "url",
+                "path",
+                "time",
+                "timestamp",
+                "seq",
+                "message_id",
+                "real_id",
+                "uniseq",
+                "resid",
+            }
+            return {
+                str(key): self._sanitize_forward_data(item, state, depth + 1)
+                for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+                if str(key).lower() not in volatile_keys
+            }
+        if isinstance(value, list):
+            if len(value) > 100:
+                state["complete"] = False
+                value = value[:100]
+            return [
+                self._sanitize_forward_data(item, state, depth + 1)
+                for item in value
+            ]
+        if isinstance(value, str) and len(value) > 2048:
+            state["complete"] = False
+            return value[:2048]
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        return str(value)
+
+    async def _canonicalize_forward_segment(
+        self,
+        event: AstrMessageEvent,
+        segment,
+        depth: int,
+        state: Dict,
+    ) -> Tuple[Optional[Dict], str]:
+        """将一个转发消息段转换为稳定结构和可读摘要。"""
+        if state["halted"]:
+            return None, ""
+        if state["segments"] >= state["limits"]["segments"]:
+            state["complete"] = False
+            state["halted"] = True
+            return None, ""
+        state["segments"] += 1
+
+        if isinstance(segment, str):
+            text = self._normalize_forward_text(segment)
+            text = self._take_forward_text(state, text)
+            return {"type": "text", "text": text}, text
+        if not isinstance(segment, dict):
+            text = self._normalize_forward_text(segment)
+            text = self._take_forward_text(state, text)
+            return {"type": "unknown", "text": text}, text
+
+        segment_type = str(segment.get("type") or "unknown").lower()
+        data = segment.get("data")
+        if not isinstance(data, dict):
+            data = segment
+
+        if segment_type in ("text", "plain"):
+            text = self._normalize_forward_text(
+                data.get("text") or data.get("content")
+            )
+            text = self._take_forward_text(state, text)
+            return {"type": "text", "text": text}, text
+
+        if segment_type == "forward":
+            nested_id = (
+                data.get("id")
+                or data.get("message_id")
+                or data.get("resid")
+            )
+            if not nested_id:
+                state["complete"] = False
+                return {"type": "forward", "missing": True}, "[无法展开的嵌套转发]"
+            nested_id = str(nested_id)
+            if len(nested_id) > 512:
+                state["complete"] = False
+                return {"type": "forward", "invalid": True}, "[无效的嵌套转发]"
+            nested = await self._expand_forward_id(
+                event,
+                nested_id,
+                depth + 1,
+                state,
+            )
+            nested_text = "\n".join(nested["display_lines"])
+            display = "[嵌套转发]"
+            if nested_text:
+                display += f"\n{nested_text}"
+            return {
+                "type": "forward",
+                "nodes": nested["canonical_nodes"],
+            }, display
+
+        if segment_type == "image":
+            state["has_image"] = True
+            media_key = self._stable_forward_media_key(data, allow_name=False)
+            if not media_key:
+                state["complete"] = False
+                media_key = "unknown"
+            return {"type": "image", "key": media_key}, "[图片]"
+
+        if segment_type in ("record", "video", "file"):
+            media_key = self._stable_forward_media_key(data)
+            if not media_key:
+                state["complete"] = False
+                media_key = "unknown"
+            labels = {"record": "语音", "video": "视频", "file": "文件"}
+            return {
+                "type": segment_type,
+                "key": media_key,
+            }, f"[{labels[segment_type]}]"
+
+        if segment_type == "face":
+            face_id = str(data.get("id") or "")
+            return {"type": "face", "id": face_id}, f"[表情:{face_id}]"
+
+        if segment_type == "at":
+            qq = str(data.get("qq") or data.get("user_id") or "")
+            return {"type": "at", "qq": qq}, f"[@{qq}]"
+
+        if segment_type == "reply":
+            return {"type": "reply"}, "[回复]"
+
+        sanitized = self._sanitize_forward_data(data, state)
+        serialized = json.dumps(
+            sanitized,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        serialized = self._take_forward_text(state, serialized)
+        canonical = {
+            "type": segment_type,
+            "data_sha256": hashlib.sha256(serialized.encode("utf-8")).hexdigest(),
+        }
+        return canonical, f"[{segment_type}]"
+
+    async def _expand_forward_id(
+        self,
+        event: AstrMessageEvent,
+        forward_id: str,
+        depth: int,
+        state: Dict,
+    ) -> Dict:
+        """在全局资源上限内递归展开一个合并转发资源。"""
+        empty_result = {"canonical_nodes": [], "display_lines": []}
+        if depth > state["limits"]["depth"]:
+            state["complete"] = False
+            return empty_result
+
+        cache_key = (forward_id, state["limits"]["depth"] - depth)
+        cached = state["cache"].get(cache_key)
+        if cached is not None:
+            return cached
+        if forward_id in state["active_ids"]:
+            state["complete"] = False
+            return empty_result
+        if state["fetches"] >= state["limits"]["fetches"]:
+            state["complete"] = False
+            return empty_result
+
+        state["active_ids"].add(forward_id)
+        try:
+            payload = await self._fetch_forward_payload(event, forward_id, state)
+            nodes = self._get_forward_nodes(payload)
+            if nodes is None:
+                state["complete"] = False
+                return empty_result
+
+            canonical_nodes = []
+            display_lines = []
+            for raw_node in nodes:
+                if state["halted"]:
+                    break
+                if state["nodes"] >= state["limits"]["nodes"]:
+                    state["complete"] = False
+                    state["halted"] = True
+                    break
+                state["nodes"] += 1
+
+                node = raw_node
+                if (
+                    isinstance(raw_node, dict)
+                    and str(raw_node.get("type") or "").lower() == "node"
+                    and isinstance(raw_node.get("data"), dict)
+                ):
+                    node = raw_node["data"]
+                if not isinstance(node, dict):
+                    state["complete"] = False
+                    continue
+
+                sender = node.get("sender")
+                if not isinstance(sender, dict):
+                    sender = {}
+                sender_id = self._normalize_forward_text(
+                    sender.get("user_id")
+                    or sender.get("uin")
+                    or node.get("user_id")
+                    or node.get("uin")
+                    or ""
+                )
+                sender_id = self._take_forward_text(state, sender_id)
+                sender_name = self._normalize_forward_text(
+                    sender.get("nickname")
+                    or sender.get("card")
+                    or node.get("nickname")
+                    or node.get("name")
+                    or sender_id
+                    or "未知"
+                )
+                sender_name = self._take_forward_text(state, sender_name) or "未知"
+
+                raw_content = node.get("message")
+                if raw_content is None:
+                    raw_content = node.get("content")
+                if isinstance(raw_content, str):
+                    raw_content = [
+                        {"type": "text", "data": {"text": raw_content}}
+                    ]
+                elif isinstance(raw_content, dict):
+                    raw_content = [raw_content]
+                elif not isinstance(raw_content, list):
+                    raw_content = []
+
+                canonical_segments = []
+                display_segments = []
+                for segment in raw_content:
+                    canonical, display = await self._canonicalize_forward_segment(
+                        event,
+                        segment,
+                        depth,
+                        state,
+                    )
+                    if canonical is not None:
+                        canonical_segments.append(canonical)
+                    if display:
+                        display_segments.append(display)
+                    if state["halted"]:
+                        break
+
+                canonical_nodes.append(
+                    {
+                        "sender_id": sender_id,
+                        "sender_name": sender_name,
+                        "segments": canonical_segments,
+                    }
+                )
+                display_content = " ".join(display_segments) or "[空消息]"
+                display_lines.append(f"{sender_name}: {display_content}")
+
+            result = {
+                "canonical_nodes": canonical_nodes,
+                "display_lines": display_lines,
+            }
+            state["cache"][cache_key] = result
+            return result
+        finally:
+            state["active_ids"].discard(forward_id)
+
+    async def _extract_forward_content(
+        self,
+        event: AstrMessageEvent,
+        forward_id: str,
+        known_message: Optional[Dict] = None,
+    ) -> Dict:
+        """展开合并转发并生成内容哈希；相同 ID 优先复用历史结果。"""
+        if known_message is not None:
+            return {
+                "forward_content": (
+                    known_message.get("forward_content")
+                    or known_message.get("content")
+                    or "[合并转发消息]"
+                ),
+                "forward_hash": known_message.get("forward_hash"),
+                "forward_node_count": known_message.get("forward_node_count", 0),
+                "forward_truncated": known_message.get("forward_truncated", False),
+                "has_image": known_message.get("has_image", False),
+                "reused": True,
+            }
+
+        state = {
+            "limits": self._get_forward_limits(),
+            "fetches": 0,
+            "nodes": 0,
+            "segments": 0,
+            "chars": 0,
+            "complete": True,
+            "halted": False,
+            "has_image": False,
+            "active_ids": set(),
+            "cache": {},
+        }
+        expanded = await self._expand_forward_id(event, forward_id, 1, state)
+        display_lines = expanded["display_lines"]
+        forward_content = "[合并转发]"
+        if display_lines:
+            forward_content += "\n" + "\n".join(display_lines)
+        if not state["complete"]:
+            forward_content += "\n[内容未完整展开]"
+
+        forward_hash = None
+        canonical_nodes = expanded["canonical_nodes"]
+        if state["complete"] and canonical_nodes:
+            serialized = json.dumps(
+                canonical_nodes,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            forward_hash = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+        logger.info(
+            f"[Memory Reboot] 合并转发展开: id={forward_id}, "
+            f"层数上限={state['limits']['depth']}, 拉取={state['fetches']}, "
+            f"节点={state['nodes']}, 消息段={state['segments']}, "
+            f"字符={state['chars']}, 完整={'是' if state['complete'] else '否'}"
+        )
+        return {
+            "forward_content": forward_content,
+            "forward_hash": forward_hash,
+            "forward_node_count": state["nodes"],
+            "forward_truncated": not state["complete"],
+            "has_image": state["has_image"],
+            "reused": False,
+        }
     
     def _build_message_summary(self, matched_msg: Dict) -> str:
         """生成匹配到的历史消息摘要。"""
@@ -1237,12 +1812,21 @@ class MemoryRebootPlugin(Star):
         elif len(content) > 200:
             content = content[:200].rstrip() + "…"
 
+        is_forward = bool(matched_msg.get("forward_id"))
         lines = [
-            "\n\n📌 之前的消息摘要",
+            (
+                "\n\n📌 之前的合并转发摘要"
+                if is_forward
+                else "\n\n📌 之前的消息摘要"
+            ),
             f"发送者：{sender_name}",
             f"时间：{time_text}",
             f"内容：{content}",
         ]
+        if is_forward and matched_msg.get("forward_node_count"):
+            lines.append(f"聊天节点：{matched_msg['forward_node_count']}条")
+        if is_forward and matched_msg.get("forward_truncated"):
+            lines.append("展开状态：内容未完整展开")
         if matched_msg.get("has_image"):
             lines.append("附件：包含图片")
         return "\n".join(lines)
@@ -1269,10 +1853,15 @@ class MemoryRebootPlugin(Star):
         chain.append(Plain(self._build_message_summary(matched_msg)))
         yield event.chain_result(chain)
     
-    async def _extract_content(self, event: AstrMessageEvent) -> Optional[Tuple[str, Optional[str]]]:
-        """提取消息内容，返回(文本内容, 图片来源)"""
+    async def _extract_content(
+        self,
+        event: AstrMessageEvent,
+        group_id: Optional[str] = None,
+    ) -> Optional[Dict]:
+        """提取普通消息或合并转发内容。"""
         text = event.message_str.strip() if event.message_str else ""
         image_sources = []
+        forward_components = []
         if hasattr(event, "message_obj") and event.message_obj:
             for comp in event.message_obj.message:
                 if isinstance(comp, Image):
@@ -1283,6 +1872,58 @@ class MemoryRebootPlugin(Star):
                     )
                     if image_source:
                         image_sources.append(image_source)
+                elif isinstance(comp, Forward):
+                    forward_components.append(comp)
+
+        if forward_components:
+            forward_id = str(getattr(forward_components[0], "id", "") or "").strip()
+            if not forward_id:
+                logger.warning("[Memory Reboot] 收到合并转发，但缺少 forward_id")
+                return {
+                    "content": text,
+                    "image_source": None,
+                    "has_image": False,
+                } if text else None
+            if len(forward_id) > 512:
+                logger.warning("[Memory Reboot] 合并转发ID异常过长，已跳过展开")
+                return {
+                    "content": text,
+                    "image_source": None,
+                    "has_image": False,
+                } if text else None
+
+            known_message = None
+            if group_id:
+                messages = self._load_messages(group_id)
+                known_message = next(
+                    (
+                        message
+                        for message in messages
+                        if str(message.get("forward_id") or "") == forward_id
+                    ),
+                    None,
+                )
+            forward_data = await self._extract_forward_content(
+                event,
+                forward_id,
+                known_message,
+            )
+            forward_content = forward_data["forward_content"]
+            content = f"{text}\n{forward_content}" if text else forward_content
+            if forward_data["reused"]:
+                logger.info(
+                    f"[Memory Reboot] 合并转发ID已记录，复用展开结果: {forward_id}"
+                )
+            return {
+                "content": content,
+                "image_source": None,
+                "has_image": forward_data["has_image"],
+                "forward_id": forward_id,
+                "forward_hash": forward_data["forward_hash"],
+                "forward_content": forward_content,
+                "forward_node_count": forward_data["forward_node_count"],
+                "forward_truncated": forward_data["forward_truncated"],
+            }
 
         if image_sources:
             for image_source in image_sources:
@@ -1291,13 +1932,21 @@ class MemoryRebootPlugin(Star):
                     img_text, _ = result
                     content = f"{text} [图片内容: {img_text}]" if text else f"[图片内容: {img_text}]"
                     logger.debug(f"[Memory Reboot] 图片转文本成功")
-                    return (content, image_source)
+                    return {
+                        "content": content,
+                        "image_source": image_source,
+                        "has_image": True,
+                    }
                 else:
                     logger.info(f"[Memory Reboot] 跳过表情包")
             if not text:
                 logger.debug(f"[Memory Reboot] 无有效内容，跳过")
                 return None
-        return (text, None) if text else None
+        return {
+            "content": text,
+            "image_source": None,
+            "has_image": False,
+        } if text else None
     
     # ==========================================================================
     # 4.10 主消息处理器
@@ -1320,15 +1969,19 @@ class MemoryRebootPlugin(Star):
         sender_name = event.get_sender_name() or sender_id
         logger.debug(f"[Memory Reboot] ━━━ 收到消息 ━━━ 群:{group_id} 发送者:{sender_name}({sender_id})")
         
-        result = await self._extract_content(event)
+        result = await self._extract_content(event, group_id)
         if not result:
             logger.debug(f"[Memory Reboot] 跳过: 内容提取失败或为表情包")
             return
         
-        content, image_source = result
+        content = result["content"]
+        image_source = result.get("image_source")
+        forward_id = result.get("forward_id")
+        forward_hash = result.get("forward_hash")
+        forward_truncated = result.get("forward_truncated", False)
 
         # 过滤：最小长度检查
-        if not image_source:
+        if not image_source and not forward_id:
             min_length = self.config.get("min_text_length", DEFAULT_MIN_TEXT_LENGTH)
             if len(content) < min_length:
                 logger.debug(f"[Memory Reboot] 跳过: 短文本({len(content)}<{min_length})")
@@ -1360,8 +2013,24 @@ class MemoryRebootPlugin(Star):
         if len(messages) % 100 == 0 and len(messages) > 0:
             self._cleanup_image_cache(group_id)
         
-        # 生成embedding和图片哈希
-        embedding = await self._get_embedding(content)
+        # 合并转发先按资源ID和稳定内容哈希精确匹配。
+        forward_matched, forward_idx, forward_match_type = self._find_forward_match(
+            messages,
+            forward_id,
+            forward_hash,
+        )
+        if forward_id:
+            logger.info(
+                f"[Memory Reboot] 合并转发匹配: "
+                f"{forward_match_type or '未命中'} "
+                f"(内容哈希={'有' if forward_hash else '无'})"
+            )
+
+        # 精确命中的转发无需再次生成embedding；未完整展开的内容也不参与语义匹配。
+        if forward_matched or forward_truncated:
+            embedding = None
+        else:
+            embedding = await self._get_embedding(content)
         logger.debug(f"[Memory Reboot] Embedding: {'成功获取' if embedding else '获取失败'}, 维度={len(embedding) if embedding else 0}")
         now = time.time()
         cached_image, image_hash = None, None
@@ -1371,9 +2040,20 @@ class MemoryRebootPlugin(Star):
         
         # 创建当前消息记录
         msg = {
-            "id": str(uuid.uuid4()), "sender_id": sender_id, "sender_name": sender_name,
-            "content": content, "timestamp": now, "embedding": embedding,
-            "has_image": image_source is not None, "cached_image": cached_image, "image_hash": image_hash
+            "id": str(uuid.uuid4()),
+            "sender_id": sender_id,
+            "sender_name": sender_name,
+            "content": content,
+            "timestamp": now,
+            "embedding": embedding,
+            "has_image": bool(result.get("has_image")),
+            "cached_image": cached_image,
+            "image_hash": image_hash,
+            "forward_id": forward_id,
+            "forward_hash": forward_hash,
+            "forward_content": result.get("forward_content"),
+            "forward_node_count": result.get("forward_node_count", 0),
+            "forward_truncated": forward_truncated,
         }
         
         # 注意：此时不追加到 messages 列表，而是创建一个包含当前消息的临时列表用于匹配
@@ -1381,7 +2061,9 @@ class MemoryRebootPlugin(Star):
         messages_with_current = messages + [msg]
         
         # 相似度匹配（使用包含当前消息的列表，但排除最后一条）
-        matched_msg, matched_idx, match_type = None, -1, None
+        matched_msg = forward_matched
+        matched_idx = forward_idx
+        match_type = forward_match_type
         text_threshold = self.config.get("similarity_threshold", DEFAULT_SIMILARITY_THRESHOLD)
         image_hash_threshold = self.config.get("image_hash_threshold", DEFAULT_IMAGE_HASH_THRESHOLD)
         
@@ -1396,7 +2078,12 @@ class MemoryRebootPlugin(Star):
             logger.info(f"[Memory Reboot] 图片哈希相似度: {img_sim:.4f} (阈值{image_hash_threshold})")
             if not matched_msg and img_matched:
                 matched_msg, matched_idx, match_type = img_matched, img_idx, "image_hash"
-            elif matched_msg and img_matched and img_matched.get("timestamp", 0) < matched_msg.get("timestamp", 0):
+            elif (
+                matched_msg
+                and match_type not in ("forward_id", "forward_hash")
+                and img_matched
+                and img_matched.get("timestamp", 0) < matched_msg.get("timestamp", 0)
+            ):
                 matched_msg, matched_idx, match_type = img_matched, img_idx, "image_hash"
         
         if not matched_msg:
@@ -1406,7 +2093,17 @@ class MemoryRebootPlugin(Star):
         
         # 人数检测（使用包含当前消息的列表）
         min_unique_senders = self.config.get("min_unique_senders", 3)
-        if match_type == "embedding" and embedding:
+        if match_type in ("forward_id", "forward_hash"):
+            unique_count, sender_list = self._count_unique_senders_by_forward(
+                messages_with_current,
+                forward_id,
+                forward_hash,
+            )
+            logger.debug(
+                f"[Memory Reboot] 人数检测(合并转发): "
+                f"{unique_count}人发送过相同内容"
+            )
+        elif match_type == "embedding" and embedding:
             unique_count, sender_list = self._count_unique_senders(messages_with_current, embedding, text_threshold)
             logger.debug(f"[Memory Reboot] 人数检测(文本): {unique_count}人发送过相似内容")
         elif match_type == "image_hash" and image_hash:
@@ -1506,13 +2203,15 @@ class MemoryRebootPlugin(Star):
                 llm_judge_status = "⚠️ 已启用但未配置提供商"
         else:
             llm_judge_status = "❌ 已禁用 (匹配即提醒)"
-        
+
+        forward_limits = self._get_forward_limits()
         status = f"""✅ Memory Reboot - 记忆状态
 
 📌 群号: {group_id}
 📊 消息数: {len(messages)}
 🧠 含embedding: {sum(1 for m in messages if m.get("embedding"))}
 🖼️ 含图片: {sum(1 for m in messages if m.get("has_image"))} (含哈希: {sum(1 for m in messages if m.get("image_hash"))})
+📨 合并转发: {sum(1 for m in messages if m.get("forward_id"))} (含内容哈希: {sum(1 for m in messages if m.get("forward_hash"))})
 
 ⚙️ 配置参数:
 📏 文本相似度阈值: {self.config.get('similarity_threshold', DEFAULT_SIMILARITY_THRESHOLD)}
@@ -1520,6 +2219,8 @@ class MemoryRebootPlugin(Star):
 👥 最少不同用户: {self.config.get('min_unique_senders', DEFAULT_MIN_UNIQUE_SENDERS)}人
 ⏰ 冷却时间: {self.config.get('cooldown_seconds', DEFAULT_COOLDOWN_SECONDS)}秒
 📅 数据保留: {self.config.get('data_retention_days', DEFAULT_DATA_RETENTION_DAYS)}天
+🧵 转发展开: 深度{forward_limits['depth']} / 拉取{forward_limits['fetches']}次 / 单次超时{forward_limits['timeout']}秒 / 节点{forward_limits['nodes']}条
+🧱 转发内容: 消息段{forward_limits['segments']}个 / 字符{forward_limits['chars']}个
 
 🛠️ 环境检查:
 - Pillow库: {'✅ 已安装 (dHash可用)' if HAS_PIL else '❌ 未安装 (降级为MD5)'}
