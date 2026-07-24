@@ -13,6 +13,8 @@ import datetime
 import shutil
 import gzip
 from typing import Optional, List, Dict, Tuple
+from urllib.parse import unquote, urlparse
+from urllib.request import url2pathname
 
 # ----- 1.2 第三方库（带依赖检查）-----
 _missing_deps = []  # 记录缺失的依赖
@@ -857,16 +859,16 @@ class MemoryRebootPlugin(Star):
     # ==========================================================================
     
     async def _cache_image(
-        self, 
-        url: str, 
-        timestamp: float, 
+        self,
+        image_source: str,
+        timestamp: float,
         group_id: str
     ) -> Tuple[Optional[str], Optional[str]]:
         """
-        下载图片并缓存到本地，同时计算感知哈希
-        
+        缓存远程或本地图片，同时计算感知哈希
+
         Args:
-            url: 图片的URL地址
+            image_source: 图片的HTTP(S)地址、本地路径或file URI
             timestamp: 消息的时间戳（用于生成文件名）
             group_id: 群组ID（用于分目录存储）
             
@@ -884,24 +886,54 @@ class MemoryRebootPlugin(Star):
             # 使用微秒部分确保文件名唯一
             filename = dt.strftime("%Y%m%d_%H%M%S") + f"_{int((timestamp % 1) * 1000000)}.jpg"
             filepath = os.path.join(cache_dir, filename)
-            
-            # 异步下载图片
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url) as response:
-                    if response.status == 200:
+
+            source = str(image_source)
+            if source.startswith(("http://", "https://")):
+                # 远程图片仍通过HTTP下载
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(source) as response:
+                        if response.status != 200:
+                            logger.warning(
+                                f"[Memory Reboot] 图片下载失败: HTTP {response.status}, "
+                                f"source={source}"
+                            )
+                            return None, None
                         with open(filepath, "wb") as f:
                             f.write(await response.read())
-                        logger.debug(f"[Memory Reboot] 图片缓存成功: {filename}")
-                        
-                        # 计算图片的感知哈希
-                        image_hash = self._compute_image_hash(filepath)
-                        if image_hash:
-                            logger.debug(f"[Memory Reboot] 图片哈希: {image_hash}")
-                        
-                        return filepath, image_hash
-                        
+            else:
+                # AstrBot v4.26.1会把收到的图片预处理为本地JPEG，并把
+                # Image.url/file/path都改成本地临时路径，不能再交给aiohttp。
+                if os.path.isabs(source):
+                    local_path = source
+                else:
+                    parsed = urlparse(source)
+                    if parsed.scheme == "file":
+                        local_path = url2pathname(unquote(parsed.path))
+                        if parsed.netloc:
+                            local_path = f"//{parsed.netloc}{local_path}"
+                    elif not parsed.scheme:
+                        local_path = source
+                    else:
+                        raise ValueError(f"不支持的图片来源格式: {source}")
+
+                if not os.path.isfile(local_path):
+                    raise FileNotFoundError(f"本地图片不存在: {local_path}")
+                shutil.copy2(local_path, filepath)
+
+            logger.debug(f"[Memory Reboot] 图片缓存成功: {filename}")
+
+            # 计算图片的感知哈希
+            image_hash = self._compute_image_hash(filepath)
+            if image_hash:
+                logger.debug(f"[Memory Reboot] 图片哈希: {image_hash}")
+
+            return filepath, image_hash
+
         except Exception as e:
-            logger.error(f"[Memory Reboot] 图片缓存失败: {e}")
+            logger.error(
+                f"[Memory Reboot] 图片缓存失败: {type(e).__name__}: {e}, "
+                f"source={image_source}"
+            )
         
         return None, None
     
@@ -1205,24 +1237,28 @@ class MemoryRebootPlugin(Star):
         yield event.chain_result(chain)
     
     async def _extract_content(self, event: AstrMessageEvent) -> Optional[Tuple[str, Optional[str]]]:
-        """提取消息内容，返回(文本内容, 图片URL)"""
+        """提取消息内容，返回(文本内容, 图片来源)"""
         text = event.message_str.strip() if event.message_str else ""
-        urls = []
+        image_sources = []
         if hasattr(event, "message_obj") and event.message_obj:
             for comp in event.message_obj.message:
                 if isinstance(comp, Image):
-                    url = getattr(comp, "url", None) or getattr(comp, "file", None)
-                    if url:
-                        urls.append(url)
-        
-        if urls:
-            for url in urls:
-                result = await self._image_to_text(url)
+                    image_source = (
+                        getattr(comp, "path", None)
+                        or getattr(comp, "url", None)
+                        or getattr(comp, "file", None)
+                    )
+                    if image_source:
+                        image_sources.append(image_source)
+
+        if image_sources:
+            for image_source in image_sources:
+                result = await self._image_to_text(image_source)
                 if result:
                     img_text, _ = result
                     content = f"{text} [图片内容: {img_text}]" if text else f"[图片内容: {img_text}]"
                     logger.debug(f"[Memory Reboot] 图片转文本成功")
-                    return (content, url)
+                    return (content, image_source)
                 else:
                     logger.info(f"[Memory Reboot] 跳过表情包")
             if not text:
@@ -1256,10 +1292,10 @@ class MemoryRebootPlugin(Star):
             logger.debug(f"[Memory Reboot] 跳过: 内容提取失败或为表情包")
             return
         
-        content, image_url = result
+        content, image_source = result
 
         # 过滤：最小长度检查
-        if not image_url:
+        if not image_source:
             min_length = self.config.get("min_text_length", DEFAULT_MIN_TEXT_LENGTH)
             if len(content) < min_length:
                 logger.debug(f"[Memory Reboot] 跳过: 短文本({len(content)}<{min_length})")
@@ -1296,15 +1332,15 @@ class MemoryRebootPlugin(Star):
         logger.debug(f"[Memory Reboot] Embedding: {'成功获取' if embedding else '获取失败'}, 维度={len(embedding) if embedding else 0}")
         now = time.time()
         cached_image, image_hash = None, None
-        if image_url:
-            cached_image, image_hash = await self._cache_image(image_url, now, group_id)
+        if image_source:
+            cached_image, image_hash = await self._cache_image(image_source, now, group_id)
             logger.debug(f"[Memory Reboot] 图片缓存: {'成功' if cached_image else '失败'}, 哈希={'有' if image_hash else '无'}")
         
         # 创建当前消息记录
         msg = {
             "id": str(uuid.uuid4()), "sender_id": sender_id, "sender_name": sender_name,
             "content": content, "timestamp": now, "embedding": embedding,
-            "has_image": image_url is not None, "cached_image": cached_image, "image_hash": image_hash
+            "has_image": image_source is not None, "cached_image": cached_image, "image_hash": image_hash
         }
         
         # 注意：此时不追加到 messages 列表，而是创建一个包含当前消息的临时列表用于匹配
