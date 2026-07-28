@@ -129,6 +129,30 @@
     "hint": "支持精确名称和utm_*形式的前缀规则。请只填写明确的推广跟踪参数，不要填写id、source、from等可能影响实际内容的参数。",
     "default": ["utm_*", "fbclid", "gclid", "dclid", "msclkid", "mc_cid", "mc_eid", "igshid", "yclid", "_openstat", "spm", "spm_id_from", "vd_source"]
   },
+  "video_duplicate_enabled": {
+    "description": "启用普通视频重复检测",
+    "type": "bool",
+    "hint": "开启后对普通视频依次使用文件SHA-256、五帧感知哈希和超限元数据进行判重。合并转发中的视频仍只参与整条转发的内容指纹。",
+    "default": true
+  },
+  "video_max_analyze_size_mb": {
+    "description": "视频下载和抽帧大小上限(MiB)",
+    "type": "int",
+    "hint": "声明大小超过上限的视频不会下载，仅在文件名和字节数都存在时使用元数据精确判重。大小未知的视频下载达到上限后会立即中止。默认100 MiB。",
+    "default": 100
+  },
+  "video_frame_hash_threshold": {
+    "description": "视频五帧平均相似度阈值",
+    "type": "float",
+    "hint": "同一归一化时间点抽取的五帧dHash平均相似度达到此值，且至少四帧不低于0.85时，认为是同一视频。默认0.90。",
+    "default": 0.90
+  },
+  "ffmpeg_path": {
+    "description": "FFmpeg可执行文件",
+    "type": "string",
+    "hint": "填写ffmpeg命令名或完整路径；ffprobe优先从同目录查找。不可用时视频判重降级为文件SHA-256和超限元数据。",
+    "default": "ffmpeg"
+  },
   "vision_prompt": {
     "description": "图片识别提示词",
     "type": "text",

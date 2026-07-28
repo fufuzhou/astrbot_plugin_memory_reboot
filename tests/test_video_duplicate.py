@@ -1,0 +1,365 @@
+import asyncio
+import hashlib
+import os
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import AsyncMock
+
+
+class _Logger:
+    def debug(self, *_args, **_kwargs):
+        pass
+
+    def info(self, *_args, **_kwargs):
+        pass
+
+    def warning(self, *_args, **_kwargs):
+        pass
+
+    def error(self, *_args, **_kwargs):
+        pass
+
+
+class _Filter:
+    @staticmethod
+    def event_message_type(*_args, **_kwargs):
+        return lambda function: function
+
+    @staticmethod
+    def command(*_args, **_kwargs):
+        return lambda function: function
+
+
+class _Component:
+    def __init__(self, **kwargs):
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+
+class _Plain(_Component):
+    def __init__(self, text="", **kwargs):
+        super().__init__(text=text, **kwargs)
+
+
+class _Image(_Component):
+    @staticmethod
+    def fromFileSystem(path):
+        return _Image(path=path, file=path)
+
+
+class _Video(_Component):
+    def __init__(self, file="", **kwargs):
+        super().__init__(file=file, **kwargs)
+
+
+class _Reply(_Component):
+    pass
+
+
+class _Forward(_Component):
+    pass
+
+
+def _install_astrbot_stubs():
+    astrbot = types.ModuleType("astrbot")
+    astrbot.__path__ = []
+    api = types.ModuleType("astrbot.api")
+    api.__path__ = []
+    api.logger = _Logger()
+
+    event = types.ModuleType("astrbot.api.event")
+    event.__path__ = []
+    event.filter = _Filter()
+    event.AstrMessageEvent = object
+
+    event_filter = types.ModuleType("astrbot.api.event.filter")
+    event_filter.EventMessageType = types.SimpleNamespace(GROUP_MESSAGE="group")
+
+    star = types.ModuleType("astrbot.api.star")
+    star.Context = object
+    star.Star = object
+    star.StarTools = types.SimpleNamespace(
+        get_data_dir=lambda: Path(tempfile.gettempdir())
+    )
+
+    components = types.ModuleType("astrbot.api.message_components")
+    components.Plain = _Plain
+    components.Image = _Image
+    components.Video = _Video
+    components.Reply = _Reply
+    components.Forward = _Forward
+
+    sys.modules.update(
+        {
+            "astrbot": astrbot,
+            "astrbot.api": api,
+            "astrbot.api.event": event,
+            "astrbot.api.event.filter": event_filter,
+            "astrbot.api.star": star,
+            "astrbot.api.message_components": components,
+        }
+    )
+
+
+_install_astrbot_stubs()
+
+from main import (  # noqa: E402
+    DEFAULT_VIDEO_FRAME_HASH_THRESHOLD,
+    FORWARD_HASH_VERSION,
+    MemoryRebootPlugin,
+    VIDEO_FRAME_POSITIONS,
+)
+
+
+class VideoDuplicateTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.plugin = object.__new__(MemoryRebootPlugin)
+        self.plugin.config = {}
+        self.plugin.data_dir = self.temp_dir.name
+        self.plugin._video_analysis_semaphore = asyncio.Semaphore(1)
+        self.plugin._ffmpeg_path = None
+        self.plugin._ffprobe_path = None
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    @staticmethod
+    def _video(
+        *,
+        sha256=None,
+        hashes=None,
+        duration_ms=10_000,
+        metadata_hash=None,
+        analysis="perceptual",
+    ):
+        return {
+            "version": 1,
+            "sha256": sha256,
+            "frame_hashes": hashes or [],
+            "duration_ms": duration_ms,
+            "metadata_hash": metadata_hash,
+            "analysis": analysis,
+        }
+
+    def test_filename_normalization_and_metadata_hash(self):
+        name = self.plugin._normalize_video_filename(
+            "https://example.test/path/My%20Video.MP4?token=temporary"
+        )
+        self.assertEqual(name, "my video.mp4")
+        self.assertEqual(
+            self.plugin._build_video_metadata_hash(name, 123),
+            hashlib.sha256(b"my video.mp4\n123").hexdigest(),
+        )
+        self.assertIsNone(self.plugin._build_video_metadata_hash("", 123))
+        self.assertIsNone(
+            self.plugin._build_video_metadata_hash("video.mp4", None)
+        )
+
+    def test_extracts_raw_onebot_file_size(self):
+        component = _Video(
+            file="opaque.mp4",
+            url="",
+        )
+        raw_url = "https://example.test/video.mp4"
+        event = types.SimpleNamespace(
+            message_obj=types.SimpleNamespace(
+                message=[component],
+                raw_message={
+                    "message": [
+                        {
+                            "type": "video",
+                            "data": {
+                                "file": "content-id.mp4",
+                                "url": raw_url,
+                                "file_size": "4096",
+                            },
+                        }
+                    ]
+                },
+            )
+        )
+
+        results = self.plugin._extract_video_components(event)
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["size"], 4096)
+        self.assertEqual(results[0]["name"], "content-id.mp4")
+        self.assertEqual(results[0]["source"], raw_url)
+
+    async def test_local_video_generates_chunked_sha_without_ffmpeg(self):
+        video_path = os.path.join(self.temp_dir.name, "sample.mp4")
+        payload = b"not-a-real-video-but-hashable"
+        with open(video_path, "wb") as file:
+            file.write(payload)
+
+        result = await self.plugin._analyze_video(
+            {
+                "source": video_path,
+                "name": "sample.mp4",
+                "size": len(payload),
+            }
+        )
+
+        self.assertEqual(result["analysis"], "sha256")
+        self.assertEqual(result["sha256"], hashlib.sha256(payload).hexdigest())
+        self.assertEqual(result["size"], len(payload))
+        self.assertEqual(result["frame_hashes"], [])
+
+    async def test_local_video_promotes_to_perceptual_after_five_frames(self):
+        video_path = os.path.join(self.temp_dir.name, "sample.mp4")
+        with open(video_path, "wb") as file:
+            file.write(b"video")
+        hashes = ["0" * 64 for _ in VIDEO_FRAME_POSITIONS]
+        self.plugin._probe_video = AsyncMock(
+            return_value={
+                "duration_ms": 10_000,
+                "width": 1920,
+                "height": 1080,
+            }
+        )
+        self.plugin._extract_video_frame_hashes = AsyncMock(
+            return_value=hashes
+        )
+
+        result = await self.plugin._analyze_video(
+            {
+                "source": video_path,
+                "name": "sample.mp4",
+                "size": 5,
+            }
+        )
+
+        self.assertEqual(result["analysis"], "perceptual")
+        self.assertEqual(result["frame_hashes"], hashes)
+        self.assertEqual(result["duration_ms"], 10_000)
+        self.assertEqual(result["width"], 1920)
+        self.assertEqual(result["height"], 1080)
+
+    async def test_oversize_declared_video_is_not_downloaded(self):
+        self.plugin._download_video = AsyncMock()
+        result = await self.plugin._analyze_video(
+            {
+                "source": "https://example.test/large.mp4",
+                "name": "large.mp4",
+                "size": 101 * 1024 * 1024,
+            }
+        )
+
+        self.assertEqual(result["analysis"], "metadata")
+        self.assertIsNotNone(result["metadata_hash"])
+        self.plugin._download_video.assert_not_awaited()
+
+    def test_frame_match_requires_duration_and_four_strong_frames(self):
+        identical = ["0" * 64 for _ in VIDEO_FRAME_POSITIONS]
+        one_bad = list(identical)
+        one_bad[-1] = ("f" * 32) + ("0" * 32)
+        two_bad = list(one_bad)
+        two_bad[-2] = ("f" * 32) + ("0" * 32)
+
+        current = self._video(hashes=identical)
+        self.assertTrue(
+            self.plugin._video_frames_match(
+                current,
+                self._video(hashes=one_bad),
+            )
+        )
+        self.assertFalse(
+            self.plugin._video_frames_match(
+                current,
+                self._video(hashes=two_bad),
+            )
+        )
+        self.assertFalse(
+            self.plugin._video_frames_match(
+                current,
+                self._video(hashes=identical, duration_ms=12_000),
+            )
+        )
+        self.assertEqual(
+            self.plugin._get_video_frame_threshold(),
+            DEFAULT_VIDEO_FRAME_HASH_THRESHOLD,
+        )
+
+    def test_file_sha_has_priority_over_earlier_frame_match(self):
+        hashes = ["0" * 64 for _ in VIDEO_FRAME_POSITIONS]
+        current = self._video(sha256="exact", hashes=hashes)
+        messages = [
+            {
+                "sender_id": "frame",
+                "videos": [self._video(sha256="other", hashes=hashes)],
+            },
+            {
+                "sender_id": "exact",
+                "videos": [self._video(sha256="exact")],
+            },
+        ]
+
+        matched, index, match_type = self.plugin._find_video_match(
+            messages,
+            [current],
+        )
+
+        self.assertIs(matched, messages[1])
+        self.assertEqual(index, 1)
+        self.assertEqual(match_type, "video_sha256")
+
+    def test_metadata_match_only_applies_to_oversize_current_video(self):
+        metadata_hash = hashlib.sha256(b"large.mp4\n200").hexdigest()
+        stored = self._video(
+            metadata_hash=metadata_hash,
+            analysis="metadata",
+        )
+        current_small = self._video(
+            metadata_hash=metadata_hash,
+            analysis="sha256",
+        )
+        current_large = self._video(
+            metadata_hash=metadata_hash,
+            analysis="metadata",
+        )
+
+        self.assertIsNone(
+            self.plugin._video_match_type([current_small], [stored])
+        )
+        self.assertEqual(
+            self.plugin._video_match_type([current_large], [stored]),
+            "video_metadata",
+        )
+
+    def test_forward_video_key_ignores_temporary_url_token(self):
+        first = {
+            "file": "https://cdn.test/video/content.mp4?token=first",
+            "file_size": 2048,
+        }
+        second = {
+            "file": "https://cdn.test/video/content.mp4?token=second",
+            "file_size": 2048,
+        }
+        changed_size = dict(second, file_size=4096)
+
+        first_key = self.plugin._stable_forward_media_key(
+            first,
+            media_type="video",
+        )
+        second_key = self.plugin._stable_forward_media_key(
+            second,
+            media_type="video",
+        )
+
+        self.assertEqual(first_key, second_key)
+        self.assertNotEqual(
+            first_key,
+            self.plugin._stable_forward_media_key(
+                changed_size,
+                media_type="video",
+            ),
+        )
+        self.assertEqual(FORWARD_HASH_VERSION, 4)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -13,6 +13,8 @@ import hashlib
 import datetime
 import shutil
 import gzip
+import subprocess
+import tempfile
 from typing import Optional, List, Dict, Tuple
 from urllib.parse import (
     parse_qs,
@@ -52,7 +54,7 @@ from astrbot.api import logger
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.event.filter import EventMessageType
 from astrbot.api.star import Context, Star, StarTools
-from astrbot.api.message_components import Plain, Image, Reply, Forward
+from astrbot.api.message_components import Plain, Image, Video, Reply, Forward
 
 # ----- 1.4 插件命令过滤相关 -----
 try:
@@ -91,7 +93,15 @@ DEFAULT_FORWARD_MAX_CHARS = 12000         # 单条消息最多提取文本字符
 DEFAULT_FORWARD_MIN_VISIBLE_CHARS = 20    # 含不可读内层转发时最少可见正文字符数
 DEFAULT_FORWARD_TEXT_MATCH_MIN_CHARS = 20 # 发送者+文本指纹最少字符数
 DEFAULT_FORWARD_TEXT_MATCH_MIN_NODES = 2  # 发送者+文本指纹最少文本节点数
-FORWARD_HASH_VERSION = 3                  # 转发内容指纹算法版本
+FORWARD_HASH_VERSION = 4                  # 转发内容指纹算法版本
+DEFAULT_VIDEO_MAX_ANALYZE_SIZE_MB = 100   # 下载并抽帧的视频大小上限
+DEFAULT_VIDEO_FRAME_HASH_THRESHOLD = 0.90 # 视频帧平均dHash相似度阈值
+DEFAULT_VIDEO_MIN_FRAME_SIMILARITY = 0.85 # 单帧dHash最低相似度
+DEFAULT_VIDEO_DOWNLOAD_TIMEOUT = 120      # 视频下载总超时（秒）
+DEFAULT_VIDEO_PROCESS_TIMEOUT = 30        # 单次ffmpeg/ffprobe超时（秒）
+VIDEO_FINGERPRINT_VERSION = 1             # 普通视频指纹算法版本
+VIDEO_FRAME_POSITIONS = (0.10, 0.30, 0.50, 0.70, 0.90)
+MAX_VIDEO_COMPONENTS_PER_MESSAGE = 3
 DEFAULT_URL_TRACKING_PARAMS = [
     "utm_*",
     "fbclid",
@@ -125,8 +135,9 @@ class MemoryRebootPlugin(Star):
         1. 消息监听与内容提取
         2. 文本Embedding相似度计算
         3. 图片感知哈希相似度计算
-        4. LLM智能判断
-        5. 提醒消息发送
+        4. 视频文件与五帧感知指纹匹配
+        5. LLM智能判断
+        6. 提醒消息发送
     
     配置项说明（通过_conf_schema.json定义）:
         - blocked_groups: 黑名单群组列表
@@ -147,6 +158,10 @@ class MemoryRebootPlugin(Star):
         - forward_debug_log: 临时输出完整的转发指纹诊断日志
         - url_only_exact_match: 纯URL消息只按规范化完整URL精确匹配
         - url_tracking_params: URL规范化时移除的跟踪参数
+        - video_duplicate_enabled: 启用普通视频重复检测
+        - video_max_analyze_size_mb: 下载并抽帧的视频大小上限
+        - video_frame_hash_threshold: 五帧平均dHash相似度阈值
+        - ffmpeg_path: FFmpeg可执行文件或命令名
     
     性能优化:
         - 内存缓存: 消息列表缓存在内存中，避免每次从磁盘加载
@@ -292,7 +307,9 @@ class MemoryRebootPlugin(Star):
         
         # 初始化内存缓存
         self._cache = {}
-        
+        self._video_analysis_semaphore = asyncio.Semaphore(1)
+        self._ffmpeg_path, self._ffprobe_path = self._resolve_ffmpeg_tools()
+
         logger.info("[Memory Reboot] 插件初始化完成（含内存缓存优化）")
 
     async def terminate(self):
@@ -1029,9 +1046,627 @@ class MemoryRebootPlugin(Star):
             return 1.0 - (diff / len(bin1))
         except Exception:
             return 0.0
-    
+
     # ==========================================================================
-    # 4.7 相似度匹配方法
+    # 4.7 视频处理与判重方法
+    # ==========================================================================
+
+    @staticmethod
+    def _find_executable(command: str) -> Optional[str]:
+        """解析外部命令，兼容PATH名称和显式文件路径。"""
+        candidate = str(command or "").strip()
+        if not candidate:
+            return None
+        if os.path.isfile(candidate):
+            return os.path.abspath(candidate)
+        return shutil.which(candidate)
+
+    def _resolve_ffmpeg_tools(self) -> Tuple[Optional[str], Optional[str]]:
+        """解析FFmpeg和同目录的ffprobe。缺失时保留精确文件哈希能力。"""
+        configured = str(self.config.get("ffmpeg_path", "ffmpeg") or "ffmpeg")
+        ffmpeg_path = self._find_executable(configured)
+        ffprobe_path = None
+        if ffmpeg_path:
+            extension = ".exe" if ffmpeg_path.lower().endswith(".exe") else ""
+            adjacent = os.path.join(
+                os.path.dirname(ffmpeg_path),
+                f"ffprobe{extension}",
+            )
+            ffprobe_path = self._find_executable(adjacent)
+        if not ffprobe_path:
+            ffprobe_path = self._find_executable("ffprobe")
+
+        if ffmpeg_path and ffprobe_path:
+            logger.info(
+                f"[Memory Reboot] 视频抽帧可用: ffmpeg={ffmpeg_path}, "
+                f"ffprobe={ffprobe_path}"
+            )
+        else:
+            logger.warning(
+                "[Memory Reboot] FFmpeg或ffprobe不可用，"
+                "视频将降级为文件SHA-256/元数据精确判重"
+            )
+        return ffmpeg_path, ffprobe_path
+
+    def _get_video_max_size_bytes(self) -> int:
+        """读取视频分析大小上限，限制在1 MiB到2 GiB。"""
+        try:
+            size_mb = int(
+                self.config.get(
+                    "video_max_analyze_size_mb",
+                    DEFAULT_VIDEO_MAX_ANALYZE_SIZE_MB,
+                )
+            )
+        except (TypeError, ValueError):
+            size_mb = DEFAULT_VIDEO_MAX_ANALYZE_SIZE_MB
+        size_mb = max(1, min(size_mb, 2048))
+        return size_mb * 1024 * 1024
+
+    def _get_video_frame_threshold(self) -> float:
+        """读取视频帧平均相似度阈值。"""
+        try:
+            threshold = float(
+                self.config.get(
+                    "video_frame_hash_threshold",
+                    DEFAULT_VIDEO_FRAME_HASH_THRESHOLD,
+                )
+            )
+        except (TypeError, ValueError):
+            threshold = DEFAULT_VIDEO_FRAME_HASH_THRESHOLD
+        return max(0.5, min(threshold, 1.0))
+
+    @staticmethod
+    def _parse_positive_int(value) -> Optional[int]:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed > 0 else None
+
+    @staticmethod
+    def _normalize_video_filename(value) -> str:
+        """从路径、URI或平台文件标识中提取稳定的小写文件名。"""
+        text = str(value or "").strip()
+        if not text or text.startswith(("base64://", "data:")):
+            return ""
+        parsed = urlparse(text)
+        if parsed.scheme:
+            text = unquote(parsed.path)
+        else:
+            text = unquote(text.split("?", 1)[0])
+        filename = re.split(r"[\\/]", text)[-1].strip().lower()
+        if len(filename) > 512:
+            return f"sha256-{hashlib.sha256(filename.encode('utf-8')).hexdigest()}"
+        return filename
+
+    @staticmethod
+    def _local_video_path(source: str) -> Optional[str]:
+        """将本地路径或file URI转换为文件系统路径。"""
+        value = str(source or "")
+        if not value:
+            return None
+        if os.path.isabs(value):
+            return value
+        parsed = urlparse(value)
+        if parsed.scheme == "file":
+            local_path = url2pathname(unquote(parsed.path))
+            if parsed.netloc:
+                local_path = f"//{parsed.netloc}{local_path}"
+            return local_path
+        if not parsed.scheme:
+            return value
+        return None
+
+    def _extract_raw_video_segments(self, event: AstrMessageEvent) -> List[Dict]:
+        """读取OneBot原始视频段，以保留AstrBot组件未声明的file_size。"""
+        message_obj = getattr(event, "message_obj", None)
+        raw_message = getattr(message_obj, "raw_message", None)
+        if not hasattr(raw_message, "get"):
+            return []
+        raw_segments = raw_message.get("message")
+        if not isinstance(raw_segments, list):
+            return []
+        return [
+            segment.get("data", {})
+            for segment in raw_segments
+            if isinstance(segment, dict)
+            and str(segment.get("type") or "").lower() == "video"
+            and isinstance(segment.get("data"), dict)
+        ]
+
+    def _extract_video_components(
+        self,
+        event: AstrMessageEvent,
+    ) -> List[Dict]:
+        """提取普通消息中的Video组件，并与OneBot原始元数据按顺序对齐。"""
+        message_obj = getattr(event, "message_obj", None)
+        components = getattr(message_obj, "message", []) if message_obj else []
+        videos = [comp for comp in components if isinstance(comp, Video)]
+        raw_segments = self._extract_raw_video_segments(event)
+        results = []
+
+        for index, component in enumerate(
+            videos[:MAX_VIDEO_COMPONENTS_PER_MESSAGE]
+        ):
+            raw_data = raw_segments[index] if index < len(raw_segments) else {}
+            component_path = str(getattr(component, "path", None) or "")
+            local_component_path = self._local_video_path(component_path)
+            if (
+                local_component_path
+                and os.path.isfile(local_component_path)
+            ):
+                source = component_path
+            else:
+                source = (
+                    getattr(component, "url", None)
+                    or raw_data.get("url")
+                    or getattr(component, "file", None)
+                    or raw_data.get("file")
+                )
+            name_source = (
+                raw_data.get("file")
+                or raw_data.get("file_name")
+                or raw_data.get("name")
+                or source
+            )
+            results.append(
+                {
+                    "component": component,
+                    "source": str(source or ""),
+                    "name": self._normalize_video_filename(name_source),
+                    "size": self._parse_positive_int(
+                        raw_data.get("file_size")
+                        or raw_data.get("size")
+                    ),
+                }
+            )
+
+        if len(videos) > MAX_VIDEO_COMPONENTS_PER_MESSAGE:
+            logger.warning(
+                f"[Memory Reboot] 单条消息含{len(videos)}个视频，"
+                f"仅处理前{MAX_VIDEO_COMPONENTS_PER_MESSAGE}个"
+            )
+        return results
+
+    @staticmethod
+    def _compute_file_sha256(file_path: str) -> Optional[str]:
+        """分块计算文件SHA-256，避免把整个视频读入内存。"""
+        try:
+            digest = hashlib.sha256()
+            with open(file_path, "rb") as file:
+                while chunk := file.read(1024 * 1024):
+                    digest.update(chunk)
+            return digest.hexdigest()
+        except Exception as exc:
+            logger.error(
+                f"[Memory Reboot] 计算视频SHA-256失败: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return None
+
+    @staticmethod
+    def _build_video_metadata_hash(
+        filename: str,
+        file_size: Optional[int],
+    ) -> Optional[str]:
+        """为免下载的大视频生成“文件名+大小”精确指纹。"""
+        if not filename or not file_size:
+            return None
+        payload = f"{filename}\n{file_size}"
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _new_video_fingerprint(
+        self,
+        video_info: Dict,
+        file_size: Optional[int],
+        analysis: str,
+    ) -> Dict:
+        filename = str(video_info.get("name") or "")
+        return {
+            "version": VIDEO_FINGERPRINT_VERSION,
+            "name": filename,
+            "size": file_size,
+            "sha256": None,
+            "frame_hashes": [],
+            "duration_ms": None,
+            "width": None,
+            "height": None,
+            "metadata_hash": self._build_video_metadata_hash(
+                filename,
+                file_size,
+            ),
+            "analysis": analysis,
+        }
+
+    async def _download_video(
+        self,
+        source: str,
+        destination: str,
+        size_limit: int,
+    ) -> Tuple[Optional[int], Optional[str], bool]:
+        """限流下载视频，返回(大小, SHA-256, 是否超限)。"""
+        timeout = aiohttp.ClientTimeout(total=DEFAULT_VIDEO_DOWNLOAD_TIMEOUT)
+        digest = hashlib.sha256()
+        downloaded = 0
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(source, allow_redirects=True) as response:
+                    if response.status != 200:
+                        raise RuntimeError(f"HTTP {response.status}")
+                    content_length = self._parse_positive_int(
+                        response.headers.get("Content-Length")
+                    )
+                    if content_length and content_length > size_limit:
+                        return content_length, None, True
+
+                    with open(destination, "wb") as file:
+                        async for chunk in response.content.iter_chunked(
+                            1024 * 1024
+                        ):
+                            downloaded += len(chunk)
+                            if downloaded > size_limit:
+                                return None, None, True
+                            digest.update(chunk)
+                            file.write(chunk)
+            return downloaded, digest.hexdigest(), False
+        except Exception as exc:
+            logger.warning(
+                f"[Memory Reboot] 视频下载失败: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return None, None, False
+
+    async def _run_media_tool(
+        self,
+        *arguments: str,
+    ) -> Tuple[int, bytes, bytes]:
+        """无Shell执行FFmpeg工具，并对单次调用施加超时。"""
+        process_kwargs = {}
+        if os.name == "nt":
+            process_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        process = await asyncio.create_subprocess_exec(
+            *arguments,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            **process_kwargs,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=DEFAULT_VIDEO_PROCESS_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.communicate()
+            raise TimeoutError(
+                f"媒体工具执行超过{DEFAULT_VIDEO_PROCESS_TIMEOUT}秒"
+            )
+        return process.returncode, stdout, stderr
+
+    async def _probe_video(self, video_path: str) -> Optional[Dict]:
+        """读取首个视频流的时长和尺寸。"""
+        if not self._ffprobe_path:
+            return None
+        try:
+            returncode, stdout, stderr = await self._run_media_tool(
+                self._ffprobe_path,
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height,duration:format=duration",
+                "-of",
+                "json",
+                video_path,
+            )
+            if returncode != 0:
+                error_text = stderr.decode("utf-8", errors="replace")[:300]
+                logger.warning(
+                    f"[Memory Reboot] ffprobe读取视频失败: {error_text}"
+                )
+                return None
+            payload = json.loads(stdout.decode("utf-8"))
+            streams = payload.get("streams") or []
+            if not streams:
+                return None
+            stream = streams[0]
+            raw_duration = (
+                (payload.get("format") or {}).get("duration")
+                or stream.get("duration")
+            )
+            duration = float(raw_duration)
+            if duration <= 0:
+                return None
+            return {
+                "duration_ms": int(round(duration * 1000)),
+                "width": self._parse_positive_int(stream.get("width")),
+                "height": self._parse_positive_int(stream.get("height")),
+            }
+        except Exception as exc:
+            logger.warning(
+                f"[Memory Reboot] ffprobe读取视频异常: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return None
+
+    async def _extract_video_frame_hashes(
+        self,
+        video_path: str,
+        duration_ms: int,
+        temp_dir: str,
+    ) -> List[str]:
+        """在五个归一化时间点抽帧并计算256位dHash。"""
+        if not self._ffmpeg_path or not HAS_PIL or duration_ms <= 0:
+            return []
+
+        hashes = []
+        duration_seconds = duration_ms / 1000.0
+        for index, position in enumerate(VIDEO_FRAME_POSITIONS):
+            frame_path = os.path.join(temp_dir, f"frame_{index}.png")
+            timestamp = max(0.001, duration_seconds * position)
+            try:
+                returncode, _, stderr = await self._run_media_tool(
+                    self._ffmpeg_path,
+                    "-nostdin",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-ss",
+                    f"{timestamp:.3f}",
+                    "-i",
+                    video_path,
+                    "-frames:v",
+                    "1",
+                    "-an",
+                    "-vf",
+                    "scale=17:16:flags=lanczos,format=gray",
+                    "-y",
+                    frame_path,
+                )
+                if returncode != 0 or not os.path.isfile(frame_path):
+                    error_text = stderr.decode(
+                        "utf-8",
+                        errors="replace",
+                    )[:300]
+                    logger.warning(
+                        f"[Memory Reboot] 视频第{index + 1}帧提取失败: "
+                        f"{error_text}"
+                    )
+                    continue
+                frame_hash = self._compute_image_hash(frame_path)
+                if frame_hash:
+                    hashes.append(frame_hash)
+            except Exception as exc:
+                logger.warning(
+                    f"[Memory Reboot] 视频第{index + 1}帧处理异常: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        return hashes
+
+    async def _analyze_video(self, video_info: Dict) -> Dict:
+        """在大小限制内生成视频精确和感知指纹。"""
+        declared_size = self._parse_positive_int(video_info.get("size"))
+        fingerprint = self._new_video_fingerprint(
+            video_info,
+            declared_size,
+            "unavailable",
+        )
+        size_limit = self._get_video_max_size_bytes()
+        if declared_size and declared_size > size_limit:
+            fingerprint["analysis"] = "metadata"
+            return fingerprint
+
+        source = str(video_info.get("source") or "")
+        if not source:
+            return fingerprint
+
+        async with self._video_analysis_semaphore:
+            with tempfile.TemporaryDirectory(
+                prefix="memory_reboot_video_",
+                dir=self.data_dir,
+            ) as temp_dir:
+                local_path = self._local_video_path(source)
+                video_path = None
+                file_sha256 = None
+                file_size = declared_size
+
+                if local_path and os.path.isfile(local_path):
+                    file_size = os.path.getsize(local_path)
+                    fingerprint = self._new_video_fingerprint(
+                        video_info,
+                        file_size,
+                        "metadata" if file_size > size_limit else "sha256",
+                    )
+                    if file_size > size_limit:
+                        return fingerprint
+                    video_path = local_path
+                    file_sha256 = await asyncio.to_thread(
+                        self._compute_file_sha256,
+                        video_path,
+                    )
+                elif source.startswith(("http://", "https://")):
+                    extension = os.path.splitext(
+                        str(video_info.get("name") or "")
+                    )[1]
+                    if not re.fullmatch(r"\.[a-zA-Z0-9]{1,8}", extension):
+                        extension = ".mp4"
+                    video_path = os.path.join(temp_dir, f"video{extension}")
+                    file_size, file_sha256, oversize = (
+                        await self._download_video(
+                            source,
+                            video_path,
+                            size_limit,
+                        )
+                    )
+                    fingerprint = self._new_video_fingerprint(
+                        video_info,
+                        file_size or declared_size,
+                        "metadata" if oversize else "sha256",
+                    )
+                    if oversize or not file_sha256:
+                        return fingerprint
+                else:
+                    logger.warning(
+                        f"[Memory Reboot] 不支持的视频来源格式: {source[:200]}"
+                    )
+                    return fingerprint
+
+                fingerprint["sha256"] = file_sha256
+                if not file_sha256 or not video_path:
+                    return fingerprint
+
+                probe = await self._probe_video(video_path)
+                if not probe:
+                    return fingerprint
+                fingerprint.update(probe)
+                frame_hashes = await self._extract_video_frame_hashes(
+                    video_path,
+                    probe["duration_ms"],
+                    temp_dir,
+                )
+                if len(frame_hashes) == len(VIDEO_FRAME_POSITIONS):
+                    fingerprint["frame_hashes"] = frame_hashes
+                    fingerprint["analysis"] = "perceptual"
+                return fingerprint
+
+    async def _analyze_videos(self, video_infos: List[Dict]) -> List[Dict]:
+        """按消息段顺序分析普通视频，单个失败不影响其余视频。"""
+        if not self._get_bool_config("video_duplicate_enabled", True):
+            return []
+        results = []
+        for video_info in video_infos:
+            try:
+                results.append(await self._analyze_video(video_info))
+            except Exception as exc:
+                logger.error(
+                    f"[Memory Reboot] 视频分析异常: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                results.append(
+                    self._new_video_fingerprint(
+                        video_info,
+                        self._parse_positive_int(video_info.get("size")),
+                        "unavailable",
+                    )
+                )
+        return results
+
+    def _video_frames_match(self, current: Dict, stored: Dict) -> bool:
+        """比较两组对齐帧，并使用时长约束减少静态画面误报。"""
+        current_hashes = current.get("frame_hashes") or []
+        stored_hashes = stored.get("frame_hashes") or []
+        if (
+            len(current_hashes) != len(VIDEO_FRAME_POSITIONS)
+            or len(stored_hashes) != len(VIDEO_FRAME_POSITIONS)
+        ):
+            return False
+
+        current_duration = self._parse_positive_int(current.get("duration_ms"))
+        stored_duration = self._parse_positive_int(stored.get("duration_ms"))
+        if not current_duration or not stored_duration:
+            return False
+        duration_limit = max(
+            1000,
+            int(max(current_duration, stored_duration) * 0.03),
+        )
+        if abs(current_duration - stored_duration) > duration_limit:
+            return False
+
+        similarities = [
+            self._hash_similarity(current_hash, stored_hash)
+            for current_hash, stored_hash in zip(
+                current_hashes,
+                stored_hashes,
+            )
+        ]
+        average = sum(similarities) / len(similarities)
+        strong_frames = sum(
+            similarity >= DEFAULT_VIDEO_MIN_FRAME_SIMILARITY
+            for similarity in similarities
+        )
+        return (
+            average >= self._get_video_frame_threshold()
+            and strong_frames >= 4
+        )
+
+    def _video_match_type(
+        self,
+        current_videos: List[Dict],
+        stored_videos: List[Dict],
+        requested_type: Optional[str] = None,
+    ) -> Optional[str]:
+        """判断两条消息的视频是否按指定层级匹配。"""
+        for current in current_videos:
+            for stored in stored_videos:
+                if requested_type in (None, "video_sha256"):
+                    current_sha = current.get("sha256")
+                    stored_sha = stored.get("sha256")
+                    if current_sha and stored_sha and current_sha == stored_sha:
+                        return "video_sha256"
+
+                if requested_type in (None, "video_frame_hash"):
+                    if self._video_frames_match(current, stored):
+                        return "video_frame_hash"
+
+                if requested_type in (None, "video_metadata"):
+                    if current.get("analysis") != "metadata":
+                        continue
+                    current_metadata = current.get("metadata_hash")
+                    stored_metadata = stored.get("metadata_hash")
+                    if (
+                        current_metadata
+                        and stored_metadata
+                        and current_metadata == stored_metadata
+                    ):
+                        return "video_metadata"
+        return None
+
+    def _find_video_match(
+        self,
+        messages: List[Dict],
+        current_videos: List[Dict],
+    ) -> Tuple[Optional[Dict], int, Optional[str]]:
+        """按文件SHA、感知帧、超限元数据的顺序查找历史视频。"""
+        if not current_videos:
+            return None, -1, None
+        for match_type in (
+            "video_sha256",
+            "video_frame_hash",
+            "video_metadata",
+        ):
+            for index, message in enumerate(messages):
+                stored_videos = message.get("videos")
+                if not isinstance(stored_videos, list):
+                    continue
+                if self._video_match_type(
+                    current_videos,
+                    stored_videos,
+                    match_type,
+                ):
+                    return message, index, match_type
+        return None, -1, None
+
+    def _count_unique_senders_by_video(
+        self,
+        messages: List[Dict],
+        current_videos: List[Dict],
+    ) -> Tuple[int, List[str]]:
+        """统计与当前任一视频匹配的不同发送者。"""
+        sender_ids = {
+            message.get("sender_id")
+            for message in messages
+            if message.get("sender_id")
+            and isinstance(message.get("videos"), list)
+            and self._video_match_type(
+                current_videos,
+                message["videos"],
+            )
+        }
+        return len(sender_ids), list(sender_ids)
+
+    # ==========================================================================
+    # 4.8 相似度匹配方法
     # ==========================================================================
 
     def _get_url_tracking_rules(self) -> List[str]:
@@ -1633,8 +2268,55 @@ class MemoryRebootPlugin(Star):
         self,
         data: Dict,
         allow_name: bool = True,
+        media_type: Optional[str] = None,
     ) -> Optional[str]:
         """提取图片、文件等媒体段中相对稳定的内容标识。"""
+        if media_type == "video":
+            for key in ("md5", "file_uuid", "file_id"):
+                value = str(data.get(key) or "").strip()
+                if value:
+                    return f"{key}:{value.lower()}"
+
+            filename = self._normalize_video_filename(
+                data.get("file")
+                or data.get("file_name")
+                or data.get("name")
+                or data.get("url")
+            )
+            file_size = self._parse_positive_int(
+                data.get("file_size") or data.get("size")
+            )
+            metadata_hash = self._build_video_metadata_hash(
+                filename,
+                file_size,
+            )
+            if metadata_hash:
+                return f"name_size_sha256:{metadata_hash}"
+
+            for source_key in ("file", "url"):
+                source = str(data.get(source_key) or "").strip()
+                if not source:
+                    continue
+                parsed = urlparse(source)
+                query = {
+                    str(query_key).lower(): query_value
+                    for query_key, query_value in parse_qs(parsed.query).items()
+                }
+                for query_key in (
+                    "md5",
+                    "fileid",
+                    "file_id",
+                    "file_uuid",
+                    "uuid",
+                ):
+                    query_value = query.get(query_key)
+                    if query_value:
+                        return (
+                            f"{query_key}:"
+                            f"{str(query_value[0]).strip().lower()}"
+                        )
+            return None
+
         keys = ["md5", "file_uuid", "file_id", "file"]
         if allow_name:
             keys.append("name")
@@ -1798,7 +2480,12 @@ class MemoryRebootPlugin(Star):
             return {"type": "image", "key": media_key}, "[图片]"
 
         if segment_type in ("record", "video", "file"):
-            media_key = self._stable_forward_media_key(data)
+            if segment_type == "video":
+                state["has_video"] = True
+            media_key = self._stable_forward_media_key(
+                data,
+                media_type=segment_type,
+            )
             if not media_key:
                 state["complete"] = False
                 media_key = "unknown"
@@ -2156,6 +2843,7 @@ class MemoryRebootPlugin(Star):
                 "forward_partial": known_message.get("forward_partial", False),
                 "forward_hash_version": FORWARD_HASH_VERSION,
                 "has_image": known_message.get("has_image", False),
+                "has_video": known_message.get("has_video", False),
                 "reused": True,
             }
         if known_message is not None:
@@ -2171,6 +2859,7 @@ class MemoryRebootPlugin(Star):
             "complete": True,
             "halted": False,
             "has_image": False,
+            "has_video": False,
             "visible_chars": 0,
             "stable_media": 0,
             "unreadable_forwards": 0,
@@ -2244,6 +2933,7 @@ class MemoryRebootPlugin(Star):
             "forward_partial": has_unreadable,
             "forward_hash_version": FORWARD_HASH_VERSION,
             "has_image": state["has_image"],
+            "has_video": state["has_video"],
             "reused": False,
         }
     
@@ -2277,6 +2967,8 @@ class MemoryRebootPlugin(Star):
             details.append("部分内容")
         if matched_msg.get("has_image"):
             details.append("含图片")
+        if matched_msg.get("has_video"):
+            details.append("含视频")
         return f"\n\n📌 {' · '.join(details)}\n{content}"
 
     async def _send_reminder(self, event: AstrMessageEvent, matched_msg: Dict):
@@ -2310,6 +3002,7 @@ class MemoryRebootPlugin(Star):
         text = event.message_str.strip() if event.message_str else ""
         image_sources = []
         forward_components = []
+        video_infos = self._extract_video_components(event)
         if hasattr(event, "message_obj") and event.message_obj:
             for comp in event.message_obj.message:
                 if isinstance(comp, Image):
@@ -2377,6 +3070,27 @@ class MemoryRebootPlugin(Star):
                 "forward_truncated": forward_data["forward_truncated"],
                 "forward_partial": forward_data["forward_partial"],
                 "forward_hash_version": forward_data["forward_hash_version"],
+                "has_video": forward_data["has_video"],
+            }
+
+        if (
+            video_infos
+            and self._get_bool_config("video_duplicate_enabled", True)
+        ):
+            names = [
+                video_info["name"]
+                for video_info in video_infos
+                if video_info.get("name")
+            ]
+            video_label = "[视频]"
+            if names:
+                video_label += " " + "、".join(names)
+            return {
+                "content": f"{text} {video_label}".strip(),
+                "image_source": None,
+                "has_image": False,
+                "has_video": True,
+                "video_infos": video_infos,
             }
 
         if image_sources:
@@ -2405,6 +3119,7 @@ class MemoryRebootPlugin(Star):
             "content": text,
             "image_source": None,
             "has_image": False,
+            "has_video": False,
             "url_only": bool(url_fingerprint),
             "url_hash": (
                 url_fingerprint.get("url_hash")
@@ -2461,9 +3176,11 @@ class MemoryRebootPlugin(Star):
         url_only = result.get("url_only", False)
         url_hash = result.get("url_hash")
         url_host = result.get("url_host")
+        has_video = bool(result.get("has_video"))
+        video_infos = result.get("video_infos") or []
 
         # 过滤：最小长度检查
-        if not image_source and not forward_id:
+        if not image_source and not forward_id and not has_video:
             min_length = self.config.get("min_text_length", DEFAULT_MIN_TEXT_LENGTH)
             if len(content) < min_length:
                 logger.debug(f"[Memory Reboot] 跳过: 短文本({len(content)}<{min_length})")
@@ -2521,9 +3238,40 @@ class MemoryRebootPlugin(Star):
                 f"发送者+文本指纹={'有' if forward_text_hash else '无'})"
             )
 
+        video_fingerprints = await self._analyze_videos(video_infos)
+        video_matched, video_idx, video_match_type = self._find_video_match(
+            messages,
+            video_fingerprints,
+        )
+        usable_video_fingerprint = any(
+            video.get("sha256")
+            or video.get("frame_hashes")
+            or (
+                video.get("analysis") == "metadata"
+                and video.get("metadata_hash")
+            )
+            for video in video_fingerprints
+        )
+        if has_video and not forward_id:
+            analysis_modes = ",".join(
+                str(video.get("analysis") or "unavailable")
+                for video in video_fingerprints
+            ) or "无指纹"
+            logger.info(
+                f"[Memory Reboot] 视频匹配: "
+                f"{video_match_type or '未命中'} "
+                f"(数量={len(video_fingerprints)}, 分析={analysis_modes})"
+            )
+
         # 精确命中的转发无需再次生成embedding；未完整或含不可读内层
         # 的转发也不参与语义匹配，避免隐藏内容不同却被误判。
-        if url_only or forward_matched or forward_truncated or forward_partial:
+        if (
+            url_only
+            or forward_matched
+            or forward_truncated
+            or forward_partial
+            or usable_video_fingerprint
+        ):
             embedding = None
         else:
             embedding = await self._get_embedding(content)
@@ -2543,8 +3291,10 @@ class MemoryRebootPlugin(Star):
             "timestamp": now,
             "embedding": embedding,
             "has_image": bool(result.get("has_image")),
+            "has_video": has_video,
             "cached_image": cached_image,
             "image_hash": image_hash,
+            "videos": video_fingerprints,
             "forward_id": forward_id,
             "forward_hash": forward_hash,
             "forward_text_hash": forward_text_hash,
@@ -2567,9 +3317,14 @@ class MemoryRebootPlugin(Star):
         messages_with_current = messages + [msg]
         
         # 相似度匹配（使用包含当前消息的列表，但排除最后一条）
-        matched_msg = url_matched or forward_matched
-        matched_idx = url_idx if url_matched else forward_idx
-        match_type = url_match_type or forward_match_type
+        matched_msg = url_matched or forward_matched or video_matched
+        if url_matched:
+            matched_idx = url_idx
+        elif forward_matched:
+            matched_idx = forward_idx
+        else:
+            matched_idx = video_idx
+        match_type = url_match_type or forward_match_type or video_match_type
         text_threshold = self.config.get("similarity_threshold", DEFAULT_SIMILARITY_THRESHOLD)
         image_hash_threshold = self.config.get("image_hash_threshold", DEFAULT_IMAGE_HASH_THRESHOLD)
         
@@ -2591,6 +3346,9 @@ class MemoryRebootPlugin(Star):
                     "forward_id",
                     "forward_hash",
                     "forward_text_hash",
+                    "video_sha256",
+                    "video_frame_hash",
+                    "video_metadata",
                 )
                 and img_matched
                 and img_matched.get("timestamp", 0) < matched_msg.get("timestamp", 0)
@@ -2623,6 +3381,19 @@ class MemoryRebootPlugin(Star):
             logger.debug(
                 f"[Memory Reboot] 人数检测(合并转发): "
                 f"{unique_count}人发送过相同内容"
+            )
+        elif match_type in (
+            "video_sha256",
+            "video_frame_hash",
+            "video_metadata",
+        ):
+            unique_count, sender_list = self._count_unique_senders_by_video(
+                messages_with_current,
+                video_fingerprints,
+            )
+            logger.debug(
+                f"[Memory Reboot] 人数检测(视频): "
+                f"{unique_count}人发送过相同视频"
             )
         elif match_type == "embedding" and embedding:
             unique_count, sender_list = self._count_unique_senders(messages_with_current, embedding, text_threshold)
@@ -2726,12 +3497,29 @@ class MemoryRebootPlugin(Star):
             llm_judge_status = "❌ 已禁用 (匹配即提醒)"
 
         forward_limits = self._get_forward_limits()
+        stored_videos = [
+            video
+            for message in messages
+            for video in (
+                message.get("videos")
+                if isinstance(message.get("videos"), list)
+                else []
+            )
+            if isinstance(video, dict)
+        ]
+        video_limit_mb = self._get_video_max_size_bytes() // (1024 * 1024)
+        ffmpeg_status = (
+            "✅ 可用"
+            if self._ffmpeg_path and self._ffprobe_path
+            else "⚠️ 不可用（降级为SHA/元数据）"
+        )
         status = f"""✅ Memory Reboot - 记忆状态
 
 📌 群号: {group_id}
 📊 消息数: {len(messages)}
 🧠 含embedding: {sum(1 for m in messages if m.get("embedding"))}
 🖼️ 含图片: {sum(1 for m in messages if m.get("has_image"))} (含哈希: {sum(1 for m in messages if m.get("image_hash"))})
+🎞️ 含视频: {sum(1 for m in messages if m.get("has_video"))} (文件SHA: {sum(1 for v in stored_videos if v.get("sha256"))} / 五帧指纹: {sum(1 for v in stored_videos if v.get("frame_hashes"))} / 元数据兜底: {sum(1 for v in stored_videos if v.get("analysis") == "metadata")})
 📨 合并转发: {sum(1 for m in messages if m.get("forward_id"))} (完整哈希: {sum(1 for m in messages if m.get("forward_hash"))} / 发送者+文本: {sum(1 for m in messages if m.get("forward_text_hash"))} / 部分可见: {sum(1 for m in messages if m.get("forward_partial"))})
 🔗 纯URL: {sum(1 for m in messages if m.get("url_only"))} (含哈希: {sum(1 for m in messages if m.get("url_hash"))})
 
@@ -2747,9 +3535,11 @@ class MemoryRebootPlugin(Star):
 📝 发送者+文本匹配: {'✅ 已开启（至少20字且2个文本节点）' if self._is_forward_sender_text_match_enabled() else '❌ 已关闭'}
 🧪 转发指纹诊断: {'⚠️ 已开启（日志含聊天内容）' if self._is_forward_debug_enabled() else '❌ 已关闭'}
 🔗 纯URL精确匹配: {'✅ 已开启' if self._get_bool_config('url_only_exact_match', True) else '❌ 已关闭'} (跟踪参数规则: {len(self._get_url_tracking_rules())}条)
+🎬 视频判重: {'✅ 已开启' if self._get_bool_config('video_duplicate_enabled', True) else '❌ 已关闭'} (分析上限: {video_limit_mb} MiB / 五帧均值阈值: {self._get_video_frame_threshold()})
 
 🛠️ 环境检查:
 - Pillow库: {'✅ 已安装 (dHash可用)' if HAS_PIL else '❌ 未安装 (降级为MD5)'}
+- FFmpeg/ffprobe: {ffmpeg_status}
 - 提醒图片: {'✅ 存在' if os.path.exists(img_path) else '⚠️ 不存在 (将发送纯文本)'}
 - 命令过滤: {cmd_filter_status}
 - LLM判断: {llm_judge_status}"""
