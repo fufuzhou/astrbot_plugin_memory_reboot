@@ -108,6 +108,7 @@ DEFAULT_URL_TRACKING_PARAMS = [
     "vd_source",
 ]
 REMINDER_IMAGE_FILENAME = "1000101866.jpg" # 提醒图片文件名
+REMINDER_SUMMARY_MAX_CHARS = 80             # 提醒摘要正文最大长度
 
 
 # ==============================================================================
@@ -2255,39 +2256,28 @@ class MemoryRebootPlugin(Star):
             timestamp = float(timestamp)
             if timestamp <= 0:
                 raise ValueError("无效时间戳")
-            time_text = (
-                f"{self._format_time(timestamp)}"
-                f"（{self._format_time_ago(timestamp)}）"
-            )
+            time_text = self._format_time_ago(timestamp)
         except (TypeError, ValueError, OverflowError, OSError):
-            time_text = "未知"
+            time_text = "时间未知"
 
         content = re.sub(r"\s+", " ", str(matched_msg.get("content") or "")).strip()
         if not content:
             content = "（无文字内容）"
-        elif len(content) > 200:
-            content = content[:200].rstrip() + "…"
+        elif len(content) > REMINDER_SUMMARY_MAX_CHARS:
+            content = content[:REMINDER_SUMMARY_MAX_CHARS].rstrip() + "…"
 
         is_forward = bool(matched_msg.get("forward_id"))
-        lines = [
-            (
-                "\n\n📌 之前的合并转发摘要"
-                if is_forward
-                else "\n\n📌 之前的消息摘要"
-            ),
-            f"发送者：{sender_name}",
-            f"时间：{time_text}",
-            f"内容：{content}",
-        ]
+        details = [sender_name, time_text]
         if is_forward and matched_msg.get("forward_node_count"):
-            lines.append(f"聊天节点：{matched_msg['forward_node_count']}条")
-        if is_forward and matched_msg.get("forward_truncated"):
-            lines.append("展开状态：内容未完整展开")
-        elif is_forward and matched_msg.get("forward_partial"):
-            lines.append("展开状态：内层不可读取，仅比较外层可见内容")
+            details.append(f"转发{matched_msg['forward_node_count']}条")
+        if is_forward and (
+            matched_msg.get("forward_truncated")
+            or matched_msg.get("forward_partial")
+        ):
+            details.append("部分内容")
         if matched_msg.get("has_image"):
-            lines.append("附件：包含图片")
-        return "\n".join(lines)
+            details.append("含图片")
+        return f"\n\n📌 {' · '.join(details)}\n{content}"
 
     async def _send_reminder(self, event: AstrMessageEvent, matched_msg: Dict):
         """发送提醒图片，并附上匹配到的历史消息摘要。"""
@@ -2445,7 +2435,14 @@ class MemoryRebootPlugin(Star):
             logger.debug(f"[Memory Reboot] 跳过: 群{group_id}在黑名单中")
             return
         
-        sender_id = event.get_sender_id()
+        sender_id = str(event.get_sender_id() or "")
+        self_id = str(event.get_self_id() or "")
+        if self_id and sender_id == self_id:
+            logger.debug(
+                f"[Memory Reboot] 跳过: 机器人自身消息({self_id})"
+            )
+            return
+
         sender_name = event.get_sender_name() or sender_id
         logger.debug(f"[Memory Reboot] ━━━ 收到消息 ━━━ 群:{group_id} 发送者:{sender_name}({sender_id})")
         
