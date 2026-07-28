@@ -32,6 +32,18 @@
     "hint": "启用后将使用LLM对匹配到的消息进行二次判断，区分复读/接龙/正常讨论与旧闻重发。关闭后匹配到相似内容即直接触发提醒（更激进但省token）。",
     "default": true
   },
+  "judge_context_window_seconds": {
+    "description": "LLM近期上下文窗口(秒)",
+    "type": "int",
+    "hint": "只把此时间窗口内的近期消息交给LLM，并用于统计复读次数。默认600秒，内部限制为60至86400秒。",
+    "default": 600
+  },
+  "judge_context_max_messages": {
+    "description": "LLM单段上下文消息上限",
+    "type": "int",
+    "hint": "历史和近期上下文各自最多发送多少条消息。默认12条，内部限制为4至40条；复读次数仍统计整个时间窗口。",
+    "default": 12
+  },
   "similarity_threshold": {
     "description": "文本相似度阈值",
     "type": "float",
@@ -168,7 +180,7 @@
   "judge_prompt": {
     "description": "判断提示词",
     "type": "text",
-    "hint": "用于判断是否提醒的提示词。可用变量：{matched_time}, {matched_time_ago}, {matched_sender}, {matched_content}, {history_str}, {current_str}, {sender_name}, {content}, {min_senders}, {unique_count}。留空则使用内置默认提示词。",
+    "hint": "用于判断是否提醒的提示词。可用变量：{matched_time}, {matched_time_ago}, {matched_sender}, {matched_content}, {history_str}, {current_str}, {context_stats}, {sender_name}, {content}, {min_senders}, {unique_count}。留空则使用内置默认提示词。",
     "default": ""
   },
   "ignore_regex": {

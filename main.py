@@ -94,6 +94,10 @@ DEFAULT_FORWARD_MIN_VISIBLE_CHARS = 20    # 含不可读内层转发时最少可
 DEFAULT_FORWARD_TEXT_MATCH_MIN_CHARS = 20 # 发送者+文本指纹最少字符数
 DEFAULT_FORWARD_TEXT_MATCH_MIN_NODES = 2  # 发送者+文本指纹最少文本节点数
 FORWARD_HASH_VERSION = 4                  # 转发内容指纹算法版本
+DEFAULT_JUDGE_CONTEXT_WINDOW_SECONDS = 600 # LLM近期上下文时间窗口
+DEFAULT_JUDGE_CONTEXT_MAX_MESSAGES = 12   # LLM单段上下文最大消息数
+MAX_JUDGE_CONTEXT_WINDOW_SECONDS = 86400  # LLM上下文时间窗口硬上限
+MAX_JUDGE_CONTEXT_MESSAGES = 40           # LLM单段上下文消息数硬上限
 DEFAULT_VIDEO_MAX_ANALYZE_SIZE_MB = 100   # 下载并抽帧的视频大小上限
 DEFAULT_VIDEO_FRAME_HASH_THRESHOLD = 0.90 # 视频帧平均dHash相似度阈值
 DEFAULT_VIDEO_MIN_FRAME_SIMILARITY = 0.85 # 单帧dHash最低相似度
@@ -149,6 +153,8 @@ class MemoryRebootPlugin(Star):
         - embedding_provider_id: Embedding模型提供商ID
         - vision_provider_id: 图片识别LLM的提供者ID
         - judge_provider_id: 判断LLM的提供者ID
+        - judge_context_window_seconds: 判断LLM近期上下文时间窗口
+        - judge_context_max_messages: 判断LLM单段上下文消息上限
         - forward_max_depth: 合并转发最大展开层数
         - forward_max_fetches: 单条消息最多调用get_forward_msg次数
         - forward_fetch_timeout: 单次调用get_forward_msg超时秒数
@@ -241,8 +247,11 @@ class MemoryRebootPlugin(Star):
 **历史上下文**：
 {history_str}
 
-**当前上下文**（最近消息）：
+**当前上下文**（时间窗口内最近消息，可能截断）：
 {current_str}
+
+**近期客观统计**（程序对完整时间窗口计算，优先于抽样上下文）：
+{context_stats}
 
 **待判断消息**：
 发送者：{sender_name}
@@ -2155,13 +2164,195 @@ class MemoryRebootPlugin(Star):
                     sender_ids.add(msg.get("sender_id"))
         return len(sender_ids), list(sender_ids)
     
-    def _get_context_around(self, messages: List[Dict], index: int, before: int = 40, after: int = 40) -> List[Dict]:
+    def _get_context_around(
+        self,
+        messages: List[Dict],
+        index: int,
+        before: int = 40,
+        after: int = 40,
+    ) -> List[Dict]:
         """获取指定消息前后的上下文"""
         start = max(0, index - before)
         end = min(len(messages), index + after + 1)
-        return [{"sender_name": m.get("sender_name"), "content": m.get("content"), "timestamp": m.get("timestamp")} 
-                for m in messages[start:end]]
-    
+        return [
+            {
+                "sender_name": message.get("sender_name"),
+                "content": message.get("content"),
+                "timestamp": message.get("timestamp"),
+            }
+            for message in messages[start:end]
+        ]
+
+    def _get_judge_context_limits(self) -> Tuple[int, int]:
+        """读取并限制LLM上下文窗口，防止错误配置导致提示词膨胀。"""
+        try:
+            window_seconds = int(
+                self.config.get(
+                    "judge_context_window_seconds",
+                    DEFAULT_JUDGE_CONTEXT_WINDOW_SECONDS,
+                )
+            )
+        except (TypeError, ValueError):
+            window_seconds = DEFAULT_JUDGE_CONTEXT_WINDOW_SECONDS
+        try:
+            max_messages = int(
+                self.config.get(
+                    "judge_context_max_messages",
+                    DEFAULT_JUDGE_CONTEXT_MAX_MESSAGES,
+                )
+            )
+        except (TypeError, ValueError):
+            max_messages = DEFAULT_JUDGE_CONTEXT_MAX_MESSAGES
+        return (
+            max(60, min(window_seconds, MAX_JUDGE_CONTEXT_WINDOW_SECONDS)),
+            max(4, min(max_messages, MAX_JUDGE_CONTEXT_MESSAGES)),
+        )
+
+    @staticmethod
+    def _normalize_judge_text(content) -> str:
+        """仅折叠空白，用于统计完全相同的近期复读。"""
+        return re.sub(r"\s+", " ", str(content or "")).strip()
+
+    @staticmethod
+    def _judge_timestamp(value, default: float = 0.0) -> float:
+        """将存量记录中的时间戳安全转换为浮点数。"""
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _build_judge_contexts(
+        self,
+        messages: List[Dict],
+        matched_idx: int,
+    ) -> Tuple[List[Dict], List[Dict], Dict]:
+        """构造有界上下文，并预计算模型判断复读所需的客观统计。"""
+        if not messages:
+            return [], [], {}
+
+        window_seconds, max_messages = self._get_judge_context_limits()
+        current_message = messages[-1]
+        current_timestamp = self._judge_timestamp(
+            current_message.get("timestamp"),
+            time.time(),
+        )
+        historical_messages = messages[:-1]
+        recent_messages = []
+        for message in historical_messages:
+            timestamp = self._judge_timestamp(message.get("timestamp"))
+            age = current_timestamp - timestamp
+            if 0 <= age <= window_seconds:
+                recent_messages.append(message)
+
+        current_context = recent_messages[-max_messages:]
+        matched_message = (
+            historical_messages[matched_idx]
+            if 0 <= matched_idx < len(historical_messages)
+            else None
+        )
+        matched_is_recent = any(
+            message is matched_message
+            for message in recent_messages
+        )
+        if matched_message and not matched_is_recent:
+            before = max_messages // 2
+            after = max_messages - before - 1
+            history_context = self._get_context_around(
+                historical_messages,
+                matched_idx,
+                before=before,
+                after=after,
+            )
+        else:
+            history_context = []
+
+        target_text = self._normalize_judge_text(
+            current_message.get("content")
+        )
+        messages_in_window = recent_messages + [current_message]
+        exact_messages = [
+            message
+            for message in messages_in_window
+            if target_text
+            and self._normalize_judge_text(message.get("content"))
+            == target_text
+        ]
+        exact_senders = {
+            str(message.get("sender_id"))
+            for message in exact_messages
+            if message.get("sender_id")
+        }
+        exact_timestamps = []
+        for message in exact_messages:
+            timestamp = self._judge_timestamp(message.get("timestamp"))
+            if timestamp > 0:
+                exact_timestamps.append(timestamp)
+
+        longest_run = 0
+        current_run = 0
+        for message in messages_in_window:
+            is_exact = (
+                bool(target_text)
+                and self._normalize_judge_text(message.get("content"))
+                == target_text
+            )
+            if is_exact:
+                current_run += 1
+                longest_run = max(longest_run, current_run)
+            else:
+                current_run = 0
+
+        stats = {
+            "window_seconds": window_seconds,
+            "messages_in_window": len(messages_in_window),
+            "exact_repeat_count": len(exact_messages),
+            "exact_unique_senders": len(exact_senders),
+            "exact_first_timestamp": (
+                min(exact_timestamps) if exact_timestamps else None
+            ),
+            "exact_last_timestamp": (
+                max(exact_timestamps) if exact_timestamps else None
+            ),
+            "exact_span_seconds": (
+                int(max(exact_timestamps) - min(exact_timestamps))
+                if exact_timestamps
+                else 0
+            ),
+            "longest_consecutive_exact": longest_run,
+            "history_context_messages": len(history_context),
+            "current_context_messages": len(current_context),
+        }
+        return history_context, current_context, stats
+
+    def _format_judge_context_stats(self, stats: Dict) -> str:
+        """将复读统计压缩为稳定、低token的提示词片段。"""
+        first_timestamp = stats.get("exact_first_timestamp")
+        last_timestamp = stats.get("exact_last_timestamp")
+        if first_timestamp and last_timestamp:
+            exact_time_range = (
+                f"{self._format_time(first_timestamp)}"
+                f" 至 {self._format_time(last_timestamp)}"
+            )
+        else:
+            exact_time_range = "无"
+        return "\n".join(
+            [
+                f"- 统计窗口：最近{stats.get('window_seconds', 0)}秒",
+                f"- 窗口内消息：{stats.get('messages_in_window', 0)}条",
+                (
+                    "- 待判断文本精确出现："
+                    f"{stats.get('exact_repeat_count', 0)}次，"
+                    f"涉及{stats.get('exact_unique_senders', 0)}名发送者"
+                ),
+                f"- 精确复读时间范围：{exact_time_range}",
+                f"- 首次至本次跨度：{stats.get('exact_span_seconds', 0)}秒",
+                (
+                    "- 最长连续相同消息："
+                    f"{stats.get('longest_consecutive_exact', 0)}条"
+                ),
+            ]
+        )
+
     # ==========================================================================
     # 4.8 时间格式化方法
     # ==========================================================================
@@ -2239,8 +2430,16 @@ class MemoryRebootPlugin(Star):
             logger.error(f"[Memory Reboot] 图片识别失败: {e}")
         return None
     
-    async def _judge_remind(self, content: str, sender_name: str, matched_msg: Dict,
-                            history_ctx: List[Dict], current_ctx: List[Dict], unique_count: int) -> bool:
+    async def _judge_remind(
+        self,
+        content: str,
+        sender_name: str,
+        matched_msg: Dict,
+        history_ctx: List[Dict],
+        current_ctx: List[Dict],
+        context_stats: Dict,
+        unique_count: int,
+    ) -> bool:
         """LLM判断是否需要提醒"""
         provider_id = self.config.get("judge_provider_id", "")
         if not provider_id:
@@ -2260,6 +2459,13 @@ class MemoryRebootPlugin(Star):
             
             history_str = "\n".join([fmt(m) for m in history_ctx])
             current_str = "\n".join([fmt(m) for m in current_ctx])
+            if not history_str:
+                history_str = "（与近期上下文重合，已省略）"
+            if not current_str:
+                current_str = "（统计窗口内无其他消息）"
+            context_stats_str = self._format_judge_context_stats(
+                context_stats
+            )
             
             matched_time_ago = self._format_time_ago(matched_msg.get("timestamp", 0))
             matched_sender = matched_msg.get("sender_name", "未知")
@@ -2275,7 +2481,8 @@ class MemoryRebootPlugin(Star):
                     matched_content=matched_content, history_str=history_str,
                     current_str=current_str, sender_name=sender_name,
                     content=content, min_senders=min_senders,
-                    unique_count=unique_count
+                    unique_count=unique_count,
+                    context_stats=context_stats_str,
                 )
             except Exception:
                 # 兼容旧版提示词如果不包含 {unique_count} 的情况
@@ -2285,7 +2492,8 @@ class MemoryRebootPlugin(Star):
                     matched_content=matched_content, history_str=history_str,
                     current_str=current_str, sender_name=sender_name,
                     content=content, min_senders=min_senders,
-                    unique_count=unique_count
+                    unique_count=unique_count,
+                    context_stats=context_stats_str,
                 )
 
             response = await provider.text_chat(prompt=prompt, contexts=[])
@@ -3673,13 +3881,30 @@ class MemoryRebootPlugin(Star):
         
         if enable_llm_judge:
             # LLM判断
-            history_ctx = self._get_context_around(messages_with_current, matched_idx, before=40, after=40)
-            current_ctx = [{"sender_name": m.get("sender_name"), "content": m.get("content"), "timestamp": m.get("timestamp")}
-                           for m in messages_with_current[:-1][-40:]]
+            history_ctx, current_ctx, context_stats = (
+                self._build_judge_contexts(
+                    messages_with_current,
+                    matched_idx,
+                )
+            )
 
-            logger.debug(f"[Memory Reboot] 进入LLM判断: 匹配={match_type}, 来自={matched_msg.get('sender_name')}, {self._format_time_ago(matched_msg.get('timestamp', 0))}")
+            logger.debug(
+                f"[Memory Reboot] 进入LLM判断: 匹配={match_type}, "
+                f"来自={matched_msg.get('sender_name')}, "
+                f"{self._format_time_ago(matched_msg.get('timestamp', 0))}, "
+                f"上下文={len(history_ctx)}+{len(current_ctx)}条, "
+                f"近期精确复读={context_stats.get('exact_repeat_count', 0)}次"
+            )
 
-            should_remind = await self._judge_remind(content, sender_name, matched_msg, history_ctx, current_ctx, unique_count)
+            should_remind = await self._judge_remind(
+                content,
+                sender_name,
+                matched_msg,
+                history_ctx,
+                current_ctx,
+                context_stats,
+                unique_count,
+            )
         else:
             # 关闭LLM判断时，直接触发提醒
             logger.debug(f"[Memory Reboot] LLM判断已关闭，直接触发提醒")
@@ -3738,6 +3963,9 @@ class MemoryRebootPlugin(Star):
             llm_judge_status = "❌ 已禁用 (匹配即提醒)"
 
         forward_limits = self._get_forward_limits()
+        judge_window_seconds, judge_max_messages = (
+            self._get_judge_context_limits()
+        )
         stored_videos = [
             video
             for message in messages
@@ -3770,6 +3998,7 @@ class MemoryRebootPlugin(Star):
 👥 最少不同用户: {self.config.get('min_unique_senders', DEFAULT_MIN_UNIQUE_SENDERS)}人
 ⏰ 冷却时间: {self.config.get('cooldown_seconds', DEFAULT_COOLDOWN_SECONDS)}秒
 📅 数据保留: {self.config.get('data_retention_days', DEFAULT_DATA_RETENTION_DAYS)}天
+🧠 LLM上下文: 最近{judge_window_seconds}秒 / 历史和近期各最多{judge_max_messages}条
 🧵 转发展开: 深度{forward_limits['depth']} / 拉取{forward_limits['fetches']}次 / 单次超时{forward_limits['timeout']}秒 / 节点{forward_limits['nodes']}条
 🧱 转发内容: 消息段{forward_limits['segments']}个 / 字符{forward_limits['chars']}个
 👁️ 部分可见哈希: 至少{forward_limits['visible_chars']}个正文字符，或包含稳定媒体标识

@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
@@ -305,6 +306,163 @@ class VideoDuplicateTests(unittest.IsolatedAsyncioTestCase):
             ),
             "用户输入的正文",
         )
+
+    def test_judge_context_is_time_bounded_compact_and_counts_repeats(self):
+        self.plugin.config.update(
+            {
+                "judge_context_window_seconds": 300,
+                "judge_context_max_messages": 4,
+            }
+        )
+        current_timestamp = 10_000
+        repeated_text = "我怀疑你在黑乌贼哥哥，而且有证据"
+        messages = [
+            {
+                "id": "matched",
+                "sender_id": "old",
+                "sender_name": "最早发送者",
+                "content": repeated_text,
+                "timestamp": current_timestamp - 1200,
+            },
+            {
+                "id": "outside-window",
+                "sender_id": "outside",
+                "sender_name": "窗口外用户",
+                "content": repeated_text,
+                "timestamp": current_timestamp - 301,
+            },
+            {
+                "id": "repeat-1",
+                "sender_id": "repeat-1",
+                "sender_name": "复读者1",
+                "content": repeated_text,
+                "timestamp": current_timestamp - 240,
+            },
+            {
+                "id": "repeat-2",
+                "sender_id": "repeat-2",
+                "sender_name": "复读者2",
+                "content": repeated_text,
+                "timestamp": current_timestamp - 180,
+            },
+            {
+                "id": "other",
+                "sender_id": "other",
+                "sender_name": "其他用户",
+                "content": "中间的其他消息",
+                "timestamp": current_timestamp - 60,
+            },
+            {
+                "id": "current",
+                "sender_id": "current",
+                "sender_name": "当前用户",
+                "content": repeated_text,
+                "timestamp": current_timestamp,
+            },
+        ]
+
+        history_ctx, current_ctx, stats = (
+            self.plugin._build_judge_contexts(messages, matched_idx=0)
+        )
+
+        self.assertLessEqual(len(history_ctx), 4)
+        self.assertEqual(len(current_ctx), 3)
+        self.assertTrue(
+            all(
+                message["timestamp"] >= current_timestamp - 300
+                for message in current_ctx
+            )
+        )
+        self.assertEqual(stats["messages_in_window"], 4)
+        self.assertEqual(stats["exact_repeat_count"], 3)
+        self.assertEqual(stats["exact_unique_senders"], 3)
+        self.assertEqual(stats["exact_span_seconds"], 240)
+        self.assertEqual(stats["longest_consecutive_exact"], 2)
+
+    def test_recent_match_does_not_duplicate_history_context(self):
+        self.plugin.config.update(
+            {
+                "judge_context_window_seconds": 600,
+                "judge_context_max_messages": 12,
+            }
+        )
+        messages = [
+            {
+                "id": "matched",
+                "sender_id": "first",
+                "content": "相同文本",
+                "timestamp": 950,
+            },
+            {
+                "id": "current",
+                "sender_id": "second",
+                "content": "相同文本",
+                "timestamp": 1000,
+            },
+        ]
+
+        history_ctx, current_ctx, stats = (
+            self.plugin._build_judge_contexts(messages, matched_idx=0)
+        )
+
+        self.assertEqual(history_ctx, [])
+        self.assertEqual(len(current_ctx), 1)
+        self.assertEqual(stats["exact_repeat_count"], 2)
+        self.assertEqual(stats["history_context_messages"], 0)
+
+    async def test_judge_prompt_contains_compact_repeat_statistics(self):
+        response = types.SimpleNamespace(
+            completion_text=json.dumps(
+                {
+                    "should_remind": False,
+                    "reason": "近期多人连续复读",
+                },
+                ensure_ascii=False,
+            )
+        )
+        provider = types.SimpleNamespace(
+            text_chat=AsyncMock(return_value=response)
+        )
+        self.plugin.context = types.SimpleNamespace(
+            get_provider_by_id=lambda _provider_id: provider
+        )
+        self.plugin.config.update(
+            {
+                "judge_provider_id": "judge-provider",
+                "min_unique_senders": 3,
+            }
+        )
+        matched = {
+            "sender_name": "最早发送者",
+            "content": "相同文本",
+            "timestamp": time.time() - 300,
+        }
+        context_stats = {
+            "window_seconds": 600,
+            "messages_in_window": 8,
+            "exact_repeat_count": 6,
+            "exact_unique_senders": 6,
+            "exact_first_timestamp": time.time() - 300,
+            "exact_last_timestamp": time.time(),
+            "exact_span_seconds": 300,
+            "longest_consecutive_exact": 4,
+        }
+
+        should_remind = await self.plugin._judge_remind(
+            "相同文本",
+            "当前发送者",
+            matched,
+            [],
+            [],
+            context_stats,
+            unique_count=6,
+        )
+
+        self.assertFalse(should_remind)
+        prompt = provider.text_chat.await_args.kwargs["prompt"]
+        self.assertIn("待判断文本精确出现：6次", prompt)
+        self.assertIn("最长连续相同消息：4条", prompt)
+        self.assertIn("与近期上下文重合，已省略", prompt)
 
     async def test_local_video_promotes_to_perceptual_after_five_frames(self):
         video_path = os.path.join(self.temp_dir.name, "sample.mp4")
