@@ -116,6 +116,19 @@
     "hint": "临时开启后，会分段输出完整的规范化指纹输入、哈希和统计信息。日志包含聊天正文及发送者信息，排查完成后请立即关闭。",
     "default": false
   },
+  "url_only_exact_match": {
+    "description": "纯URL消息仅按完整链接精确匹配",
+    "type": "bool",
+    "hint": "整条消息只有一个HTTP(S)链接时，绕过Embedding，只比较规范化后的完整URL哈希，避免同一网站的不同链接被误判。",
+    "default": true
+  },
+  "url_tracking_params": {
+    "description": "URL规范化时移除的跟踪参数",
+    "type": "list",
+    "items": {"type": "string"},
+    "hint": "支持精确名称和utm_*形式的前缀规则。请只填写明确的推广跟踪参数，不要填写id、source、from等可能影响实际内容的参数。",
+    "default": ["utm_*", "fbclid", "gclid", "dclid", "msclkid", "mc_cid", "mc_eid", "igshid", "yclid", "_openstat", "spm", "spm_id_from", "vd_source"]
+  },
   "vision_prompt": {
     "description": "图片识别提示词",
     "type": "text",

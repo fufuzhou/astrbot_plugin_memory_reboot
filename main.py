@@ -14,7 +14,14 @@ import datetime
 import shutil
 import gzip
 from typing import Optional, List, Dict, Tuple
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import (
+    parse_qs,
+    parse_qsl,
+    unquote,
+    urlencode,
+    urlparse,
+    urlunparse,
+)
 from urllib.request import url2pathname
 
 # ----- 1.2 第三方库（带依赖检查）-----
@@ -85,6 +92,21 @@ DEFAULT_FORWARD_MIN_VISIBLE_CHARS = 20    # 含不可读内层转发时最少可
 DEFAULT_FORWARD_TEXT_MATCH_MIN_CHARS = 20 # 发送者+文本指纹最少字符数
 DEFAULT_FORWARD_TEXT_MATCH_MIN_NODES = 2  # 发送者+文本指纹最少文本节点数
 FORWARD_HASH_VERSION = 3                  # 转发内容指纹算法版本
+DEFAULT_URL_TRACKING_PARAMS = [
+    "utm_*",
+    "fbclid",
+    "gclid",
+    "dclid",
+    "msclkid",
+    "mc_cid",
+    "mc_eid",
+    "igshid",
+    "yclid",
+    "_openstat",
+    "spm",
+    "spm_id_from",
+    "vd_source",
+]
 REMINDER_IMAGE_FILENAME = "1000101866.jpg" # 提醒图片文件名
 
 
@@ -122,6 +144,8 @@ class MemoryRebootPlugin(Star):
         - forward_min_visible_chars: 内层不可读时生成哈希所需可见正文长度
         - forward_sender_text_match: 使用发送者ID和文本精确匹配转发
         - forward_debug_log: 临时输出完整的转发指纹诊断日志
+        - url_only_exact_match: 纯URL消息只按规范化完整URL精确匹配
+        - url_tracking_params: URL规范化时移除的跟踪参数
     
     性能优化:
         - 内存缓存: 消息列表缓存在内存中，避免每次从磁盘加载
@@ -1008,6 +1032,145 @@ class MemoryRebootPlugin(Star):
     # ==========================================================================
     # 4.7 相似度匹配方法
     # ==========================================================================
+
+    def _get_url_tracking_rules(self) -> List[str]:
+        """读取需要从纯URL指纹中移除的跟踪参数规则。"""
+        rules = self.config.get(
+            "url_tracking_params",
+            DEFAULT_URL_TRACKING_PARAMS,
+        )
+        if not isinstance(rules, list):
+            return list(DEFAULT_URL_TRACKING_PARAMS)
+        normalized_rules = []
+        for rule in rules:
+            value = str(rule or "").strip().lower()
+            if value:
+                normalized_rules.append(value)
+        return normalized_rules
+
+    @staticmethod
+    def _is_url_tracking_param(name: str, rules: List[str]) -> bool:
+        """支持精确参数名和utm_*形式的前缀规则。"""
+        lowered = name.lower()
+        for rule in rules:
+            if rule.endswith("*") and lowered.startswith(rule[:-1]):
+                return True
+            if lowered == rule:
+                return True
+        return False
+
+    def _normalize_url_only(self, text: str) -> Optional[str]:
+        """识别纯HTTP(S) URL并进行保守、确定性的规范化。"""
+        candidate = str(text or "").strip()
+        if candidate.startswith("<") and candidate.endswith(">"):
+            candidate = candidate[1:-1].strip()
+        if not candidate or len(candidate) > 8192:
+            return None
+        if not re.fullmatch(r"https?://[^\s<>]+", candidate, re.IGNORECASE):
+            return None
+
+        try:
+            parsed = urlparse(candidate)
+            if parsed.scheme.lower() not in ("http", "https"):
+                return None
+            if not parsed.hostname or parsed.username or parsed.password:
+                return None
+
+            scheme = parsed.scheme.lower()
+            host = parsed.hostname.encode("idna").decode("ascii").lower()
+            if ":" in host:
+                host = f"[{host}]"
+            port = parsed.port
+            if port and not (
+                (scheme == "http" and port == 80)
+                or (scheme == "https" and port == 443)
+            ):
+                host = f"{host}:{port}"
+
+            query_items = parse_qsl(
+                parsed.query,
+                keep_blank_values=True,
+            )
+            tracking_rules = self._get_url_tracking_rules()
+            query_items = [
+                (name, value)
+                for name, value in query_items
+                if not self._is_url_tracking_param(name, tracking_rules)
+            ]
+            query_items.sort(key=lambda item: (item[0], item[1]))
+            normalized_query = urlencode(query_items, doseq=True)
+            return urlunparse(
+                (
+                    scheme,
+                    host,
+                    parsed.path or "/",
+                    parsed.params,
+                    normalized_query,
+                    "",
+                )
+            )
+        except (UnicodeError, ValueError):
+            return None
+
+    def _extract_url_fingerprint(self, text: str) -> Optional[Dict]:
+        """返回纯URL消息的规范化哈希和主机名。"""
+        if not self._get_bool_config("url_only_exact_match", True):
+            return None
+        normalized_url = self._normalize_url_only(text)
+        if not normalized_url:
+            return None
+        parsed = urlparse(normalized_url)
+        return {
+            "url_hash": hashlib.sha256(
+                normalized_url.encode("utf-8")
+            ).hexdigest(),
+            "url_host": parsed.hostname or "",
+        }
+
+    def _get_message_url_hash(self, message: Dict) -> Optional[str]:
+        """兼容尚未保存url_hash的旧消息记录。"""
+        if not self._get_bool_config("url_only_exact_match", True):
+            return None
+        content = str(message.get("content") or "")
+        if message.get("url_only") or content.lstrip().lower().startswith(
+            ("http://", "https://", "<http://", "<https://")
+        ):
+            fingerprint = self._extract_url_fingerprint(content)
+            if fingerprint:
+                return fingerprint["url_hash"]
+        stored_hash = message.get("url_hash")
+        return str(stored_hash) if stored_hash else None
+
+    def _find_url_match(
+        self,
+        messages: List[Dict],
+        url_hash: Optional[str],
+        exclude_recent: int = 0,
+    ) -> Tuple[Optional[Dict], int, Optional[str]]:
+        """按规范化完整URL哈希查找历史消息。"""
+        if not url_hash:
+            return None, -1, None
+        search_range = len(messages)
+        if exclude_recent > 0:
+            search_range -= exclude_recent
+        for index in range(search_range):
+            if self._get_message_url_hash(messages[index]) == url_hash:
+                return messages[index], index, "url_hash"
+        return None, -1, None
+
+    def _count_unique_senders_by_url(
+        self,
+        messages: List[Dict],
+        url_hash: str,
+    ) -> Tuple[int, List[str]]:
+        """统计发送同一规范化URL的不同用户。"""
+        sender_ids = {
+            message.get("sender_id")
+            for message in messages
+            if self._get_message_url_hash(message) == url_hash
+            and message.get("sender_id")
+        }
+        return len(sender_ids), list(sender_ids)
 
     @staticmethod
     def _is_same_forward(
@@ -2243,10 +2406,26 @@ class MemoryRebootPlugin(Star):
             if not text:
                 logger.debug(f"[Memory Reboot] 无有效内容，跳过")
                 return None
+        url_fingerprint = (
+            self._extract_url_fingerprint(text)
+            if text and not image_sources
+            else None
+        )
         return {
             "content": text,
             "image_source": None,
             "has_image": False,
+            "url_only": bool(url_fingerprint),
+            "url_hash": (
+                url_fingerprint.get("url_hash")
+                if url_fingerprint
+                else None
+            ),
+            "url_host": (
+                url_fingerprint.get("url_host")
+                if url_fingerprint
+                else None
+            ),
         } if text else None
     
     # ==========================================================================
@@ -2282,6 +2461,9 @@ class MemoryRebootPlugin(Star):
         forward_text_hash = result.get("forward_text_hash")
         forward_truncated = result.get("forward_truncated", False)
         forward_partial = result.get("forward_partial", False)
+        url_only = result.get("url_only", False)
+        url_hash = result.get("url_hash")
+        url_host = result.get("url_host")
 
         # 过滤：最小长度检查
         if not image_source and not forward_id:
@@ -2315,7 +2497,18 @@ class MemoryRebootPlugin(Star):
         # 定期清理图片缓存（每100条消息触发一次）
         if len(messages) % 100 == 0 and len(messages) > 0:
             self._cleanup_image_cache(group_id)
-        
+
+        url_matched, url_idx, url_match_type = self._find_url_match(
+            messages,
+            url_hash,
+        )
+        if url_only:
+            logger.info(
+                f"[Memory Reboot] 纯URL匹配: "
+                f"{url_match_type or '未命中'} "
+                f"(host={url_host}, hash={url_hash[:12] if url_hash else '无'})"
+            )
+
         # 合并转发先按资源ID和稳定内容哈希精确匹配。
         forward_matched, forward_idx, forward_match_type = self._find_forward_match(
             messages,
@@ -2333,7 +2526,7 @@ class MemoryRebootPlugin(Star):
 
         # 精确命中的转发无需再次生成embedding；未完整或含不可读内层
         # 的转发也不参与语义匹配，避免隐藏内容不同却被误判。
-        if forward_matched or forward_truncated or forward_partial:
+        if url_only or forward_matched or forward_truncated or forward_partial:
             embedding = None
         else:
             embedding = await self._get_embedding(content)
@@ -2367,6 +2560,9 @@ class MemoryRebootPlugin(Star):
             "forward_truncated": forward_truncated,
             "forward_partial": forward_partial,
             "forward_hash_version": result.get("forward_hash_version"),
+            "url_only": url_only,
+            "url_hash": url_hash,
+            "url_host": url_host,
         }
         
         # 注意：此时不追加到 messages 列表，而是创建一个包含当前消息的临时列表用于匹配
@@ -2374,9 +2570,9 @@ class MemoryRebootPlugin(Star):
         messages_with_current = messages + [msg]
         
         # 相似度匹配（使用包含当前消息的列表，但排除最后一条）
-        matched_msg = forward_matched
-        matched_idx = forward_idx
-        match_type = forward_match_type
+        matched_msg = url_matched or forward_matched
+        matched_idx = url_idx if url_matched else forward_idx
+        match_type = url_match_type or forward_match_type
         text_threshold = self.config.get("similarity_threshold", DEFAULT_SIMILARITY_THRESHOLD)
         image_hash_threshold = self.config.get("image_hash_threshold", DEFAULT_IMAGE_HASH_THRESHOLD)
         
@@ -2394,6 +2590,7 @@ class MemoryRebootPlugin(Star):
             elif (
                 matched_msg
                 and match_type not in (
+                    "url_hash",
                     "forward_id",
                     "forward_hash",
                     "forward_text_hash",
@@ -2410,7 +2607,16 @@ class MemoryRebootPlugin(Star):
         
         # 人数检测（使用包含当前消息的列表）
         min_unique_senders = self.config.get("min_unique_senders", 3)
-        if match_type in ("forward_id", "forward_hash", "forward_text_hash"):
+        if match_type == "url_hash" and url_hash:
+            unique_count, sender_list = self._count_unique_senders_by_url(
+                messages_with_current,
+                url_hash,
+            )
+            logger.debug(
+                f"[Memory Reboot] 人数检测(纯URL): "
+                f"{unique_count}人发送过相同链接"
+            )
+        elif match_type in ("forward_id", "forward_hash", "forward_text_hash"):
             unique_count, sender_list = self._count_unique_senders_by_forward(
                 messages_with_current,
                 forward_id,
@@ -2530,6 +2736,7 @@ class MemoryRebootPlugin(Star):
 🧠 含embedding: {sum(1 for m in messages if m.get("embedding"))}
 🖼️ 含图片: {sum(1 for m in messages if m.get("has_image"))} (含哈希: {sum(1 for m in messages if m.get("image_hash"))})
 📨 合并转发: {sum(1 for m in messages if m.get("forward_id"))} (完整哈希: {sum(1 for m in messages if m.get("forward_hash"))} / 发送者+文本: {sum(1 for m in messages if m.get("forward_text_hash"))} / 部分可见: {sum(1 for m in messages if m.get("forward_partial"))})
+🔗 纯URL: {sum(1 for m in messages if m.get("url_only"))} (含哈希: {sum(1 for m in messages if m.get("url_hash"))})
 
 ⚙️ 配置参数:
 📏 文本相似度阈值: {self.config.get('similarity_threshold', DEFAULT_SIMILARITY_THRESHOLD)}
@@ -2542,6 +2749,7 @@ class MemoryRebootPlugin(Star):
 👁️ 部分可见哈希: 至少{forward_limits['visible_chars']}个正文字符，或包含稳定媒体标识
 📝 发送者+文本匹配: {'✅ 已开启（至少20字且2个文本节点）' if self._is_forward_sender_text_match_enabled() else '❌ 已关闭'}
 🧪 转发指纹诊断: {'⚠️ 已开启（日志含聊天内容）' if self._is_forward_debug_enabled() else '❌ 已关闭'}
+🔗 纯URL精确匹配: {'✅ 已开启' if self._get_bool_config('url_only_exact_match', True) else '❌ 已关闭'} (跟踪参数规则: {len(self._get_url_tracking_rules())}条)
 
 🛠️ 环境检查:
 - Pillow库: {'✅ 已安装 (dHash可用)' if HAS_PIL else '❌ 未安装 (降级为MD5)'}
