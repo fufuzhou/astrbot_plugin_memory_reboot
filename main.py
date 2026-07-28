@@ -162,6 +162,7 @@ class MemoryRebootPlugin(Star):
         - video_max_analyze_size_mb: 下载并抽帧的视频大小上限
         - video_frame_hash_threshold: 五帧平均dHash相似度阈值
         - ffmpeg_path: FFmpeg可执行文件或命令名
+        - video_debug_log: 临时输出视频处理后的特征指纹
     
     性能优化:
         - 内存缓存: 消息列表缓存在内存中，避免每次从磁盘加载
@@ -1552,6 +1553,81 @@ class MemoryRebootPlugin(Star):
                 )
         return results
 
+    def _log_video_debug(
+        self,
+        event: AstrMessageEvent,
+        group_id: str,
+        videos: List[Dict],
+        match_type: Optional[str],
+        matched_message: Optional[Dict],
+    ) -> None:
+        """分段输出视频处理结果，不记录视频URL、路径或文件名。"""
+        if not self._is_video_debug_enabled():
+            return
+
+        message_obj = getattr(event, "message_obj", None)
+        message_id = getattr(message_obj, "message_id", None)
+        fingerprints = []
+        for index, video in enumerate(videos):
+            fingerprints.append(
+                {
+                    "index": index,
+                    "version": video.get("version"),
+                    "analysis": video.get("analysis"),
+                    "size": video.get("size"),
+                    "sha256": video.get("sha256"),
+                    "frame_hashes": video.get("frame_hashes") or [],
+                    "duration_ms": video.get("duration_ms"),
+                    "width": video.get("width"),
+                    "height": video.get("height"),
+                    "metadata_hash": video.get("metadata_hash"),
+                }
+            )
+
+        payload = {
+            "group_id": str(group_id),
+            "message_id": str(message_id or ""),
+            "match_type": match_type,
+            "matched_record_id": (
+                matched_message.get("id")
+                if isinstance(matched_message, dict)
+                else None
+            ),
+            "limits": {
+                "max_analyze_size_bytes": self._get_video_max_size_bytes(),
+                "frame_average_threshold": self._get_video_frame_threshold(),
+                "frame_min_similarity": DEFAULT_VIDEO_MIN_FRAME_SIMILARITY,
+                "required_strong_frames": 4,
+                "duration_tolerance": "max(1000ms,3%)",
+            },
+            "fingerprints": fingerprints,
+        }
+        serialized = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        chunk_size = 1800
+        total_chunks = max(
+            1,
+            (len(serialized) + chunk_size - 1) // chunk_size,
+        )
+        log_id = str(message_id or "unknown")
+        logger.info(
+            "[Memory Reboot][VideoDebug] 视频指纹诊断已启用；"
+            f"不包含视频URL、路径、文件名或正文。id={log_id}, "
+            f"分段={total_chunks}"
+        )
+        for index in range(total_chunks):
+            start = index * chunk_size
+            chunk = serialized[start:start + chunk_size]
+            logger.info(
+                f"[Memory Reboot][VideoDebug] id={log_id} "
+                f"part={index + 1}/{total_chunks} data={chunk}"
+            )
+        logger.info(f"[Memory Reboot][VideoDebug] id={log_id} END")
+
     def _video_frames_match(self, current: Dict, stored: Dict) -> bool:
         """比较两组对齐帧，并使用时长约束减少静态画面误报。"""
         current_hashes = current.get("frame_hashes") or []
@@ -2674,6 +2750,10 @@ class MemoryRebootPlugin(Star):
         """读取发送者ID+文本精确匹配开关。"""
         return self._get_bool_config("forward_sender_text_match", True)
 
+    def _is_video_debug_enabled(self) -> bool:
+        """读取视频特征指纹诊断开关。"""
+        return self._get_bool_config("video_debug_log", False)
+
     def _get_bool_config(self, key: str, default: bool) -> bool:
         """读取布尔配置，并兼容字符串形式。"""
         enabled = self.config.get(key, default)
@@ -3243,6 +3323,14 @@ class MemoryRebootPlugin(Star):
             messages,
             video_fingerprints,
         )
+        if has_video and not forward_id:
+            self._log_video_debug(
+                event,
+                group_id,
+                video_fingerprints,
+                video_match_type,
+                video_matched,
+            )
         usable_video_fingerprint = any(
             video.get("sha256")
             or video.get("frame_hashes")
@@ -3536,6 +3624,7 @@ class MemoryRebootPlugin(Star):
 🧪 转发指纹诊断: {'⚠️ 已开启（日志含聊天内容）' if self._is_forward_debug_enabled() else '❌ 已关闭'}
 🔗 纯URL精确匹配: {'✅ 已开启' if self._get_bool_config('url_only_exact_match', True) else '❌ 已关闭'} (跟踪参数规则: {len(self._get_url_tracking_rules())}条)
 🎬 视频判重: {'✅ 已开启' if self._get_bool_config('video_duplicate_enabled', True) else '❌ 已关闭'} (分析上限: {video_limit_mb} MiB / 五帧均值阈值: {self._get_video_frame_threshold()})
+🧪 视频指纹诊断: {'⚠️ 已开启（稳定后请关闭）' if self._is_video_debug_enabled() else '❌ 已关闭'}
 
 🛠️ 环境检查:
 - Pillow库: {'✅ 已安装 (dHash可用)' if HAS_PIL else '❌ 未安装 (降级为MD5)'}

@@ -153,6 +153,12 @@
     "hint": "填写ffmpeg命令名或完整路径；ffprobe优先从同目录查找。不可用时视频判重降级为文件SHA-256和超限元数据。",
     "default": "ffmpeg"
   },
+  "video_debug_log": {
+    "description": "输出视频特征指纹诊断日志",
+    "type": "bool",
+    "hint": "临时开启后，会分段输出处理模式、文件大小、SHA-256、五帧dHash、时长、分辨率、元数据指纹和匹配类型；不输出视频URL、路径、文件名或正文。验证稳定后请关闭。",
+    "default": false
+  },
   "vision_prompt": {
     "description": "图片识别提示词",
     "type": "text",

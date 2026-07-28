@@ -1,12 +1,13 @@
 import asyncio
 import hashlib
+import json
 import os
 import sys
 import tempfile
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 
 class _Logger:
@@ -359,6 +360,71 @@ class VideoDuplicateTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
         self.assertEqual(FORWARD_HASH_VERSION, 4)
+
+    def test_video_debug_log_is_default_off(self):
+        event = types.SimpleNamespace(
+            message_obj=types.SimpleNamespace(message_id="message-1")
+        )
+        with patch("main.logger") as test_logger:
+            self.plugin._log_video_debug(
+                event,
+                "group-1",
+                [],
+                None,
+                None,
+            )
+        test_logger.info.assert_not_called()
+
+    def test_video_debug_log_outputs_reconstructable_safe_fingerprints(self):
+        self.plugin.config["video_debug_log"] = "true"
+        event = types.SimpleNamespace(
+            message_obj=types.SimpleNamespace(message_id="message-2")
+        )
+        video = {
+            "version": 1,
+            "name": "private-name.mp4",
+            "source": "https://private.example/video.mp4",
+            "analysis": "perceptual",
+            "size": 1234,
+            "sha256": "a" * 64,
+            "frame_hashes": ["b" * 64 for _ in VIDEO_FRAME_POSITIONS],
+            "duration_ms": 5000,
+            "width": 1280,
+            "height": 720,
+            "metadata_hash": "c" * 64,
+        }
+        matched = {"id": "stored-record"}
+
+        with patch("main.logger") as test_logger:
+            self.plugin._log_video_debug(
+                event,
+                "group-2",
+                [video],
+                "video_frame_hash",
+                matched,
+            )
+
+        lines = [
+            call.args[0]
+            for call in test_logger.info.call_args_list
+        ]
+        part_lines = [line for line in lines if " data=" in line]
+        serialized = "".join(
+            line.split(" data=", 1)[1]
+            for line in part_lines
+        )
+        payload = json.loads(serialized)
+
+        self.assertTrue(lines[-1].endswith("END"))
+        self.assertEqual(payload["message_id"], "message-2")
+        self.assertEqual(payload["match_type"], "video_frame_hash")
+        self.assertEqual(payload["matched_record_id"], "stored-record")
+        self.assertEqual(
+            payload["fingerprints"][0]["frame_hashes"],
+            video["frame_hashes"],
+        )
+        self.assertNotIn("private-name.mp4", serialized)
+        self.assertNotIn("private.example", serialized)
 
 
 if __name__ == "__main__":
