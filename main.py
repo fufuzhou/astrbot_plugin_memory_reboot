@@ -1191,6 +1191,10 @@ class MemoryRebootPlugin(Star):
         ):
             raw_data = raw_segments[index] if index < len(raw_segments) else {}
             component_path = str(getattr(component, "path", None) or "")
+            file_reference = (
+                raw_data.get("file")
+                or getattr(component, "file", None)
+            )
             local_component_path = self._local_video_path(component_path)
             if (
                 local_component_path
@@ -1214,6 +1218,7 @@ class MemoryRebootPlugin(Star):
                 {
                     "component": component,
                     "source": str(source or ""),
+                    "file_reference": str(file_reference or ""),
                     "name": self._normalize_video_filename(name_source),
                     "size": self._parse_positive_int(
                         raw_data.get("file_size")
@@ -1228,6 +1233,94 @@ class MemoryRebootPlugin(Star):
                 f"仅处理前{MAX_VIDEO_COMPONENTS_PER_MESSAGE}个"
             )
         return results
+
+    @staticmethod
+    def _onebot_response_data(result) -> Optional[Dict]:
+        """兼容直接数据和标准OneBot响应外壳。"""
+        if not hasattr(result, "get"):
+            return None
+        data = result.get("data")
+        if isinstance(data, dict):
+            return data
+        return result if isinstance(result, dict) else None
+
+    async def _fetch_video_source_from_onebot(
+        self,
+        event: Optional[AstrMessageEvent],
+        video_info: Dict,
+    ) -> Optional[Dict]:
+        """使用消息中的资源标识要求协议端重新下载视频。"""
+        file_reference = str(video_info.get("file_reference") or "").strip()
+        if not event or not file_reference:
+            return None
+
+        bot = getattr(event, "bot", None)
+        call_action = getattr(bot, "call_action", None)
+        if not callable(call_action):
+            call_action = getattr(getattr(bot, "api", None), "call_action", None)
+        if not callable(call_action):
+            logger.warning(
+                "[Memory Reboot] 当前消息平台不支持 get_file，无法取回视频"
+            )
+            return None
+
+        routing_params = {}
+        self_id = getattr(getattr(event, "message_obj", None), "self_id", None)
+        if self_id:
+            routing_params["self_id"] = self_id
+
+        try:
+            result = await asyncio.wait_for(
+                call_action(
+                    "get_file",
+                    file=file_reference,
+                    **routing_params,
+                ),
+                timeout=DEFAULT_VIDEO_DOWNLOAD_TIMEOUT,
+            )
+        except Exception as exc:
+            logger.warning(
+                f"[Memory Reboot] 通过 get_file 取回视频失败: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return None
+
+        data = self._onebot_response_data(result)
+        if not data:
+            logger.warning(
+                "[Memory Reboot] get_file 未返回可用的视频文件信息"
+            )
+            return None
+
+        response_size = self._parse_positive_int(data.get("file_size"))
+        response_name = self._normalize_video_filename(
+            data.get("file_name")
+        )
+        for candidate in (data.get("url"), data.get("file")):
+            source = str(candidate or "").strip()
+            if not source:
+                continue
+            if source.startswith(("http://", "https://")):
+                return {
+                    "source": source,
+                    "source_method": "get_file_http",
+                    "size": response_size,
+                    "name": response_name,
+                }
+            local_path = self._local_video_path(source)
+            if local_path and os.path.isfile(local_path):
+                return {
+                    "source": source,
+                    "source_method": "get_file_local",
+                    "size": response_size,
+                    "name": response_name,
+                }
+
+        logger.warning(
+            "[Memory Reboot] get_file 已执行，但返回路径在AstrBot中不可读；"
+            "请检查NapCat媒体目录的共享挂载"
+        )
+        return None
 
     @staticmethod
     def _compute_file_sha256(file_path: str) -> Optional[str]:
@@ -1277,6 +1370,7 @@ class MemoryRebootPlugin(Star):
                 file_size,
             ),
             "analysis": analysis,
+            "source_method": video_info.get("source_method", "unavailable"),
         }
 
     async def _download_video(
@@ -1445,11 +1539,16 @@ class MemoryRebootPlugin(Star):
                 )
         return hashes
 
-    async def _analyze_video(self, video_info: Dict) -> Dict:
+    async def _analyze_video(
+        self,
+        video_info: Dict,
+        event: Optional[AstrMessageEvent] = None,
+    ) -> Dict:
         """在大小限制内生成视频精确和感知指纹。"""
-        declared_size = self._parse_positive_int(video_info.get("size"))
+        resolved_info = dict(video_info)
+        declared_size = self._parse_positive_int(resolved_info.get("size"))
         fingerprint = self._new_video_fingerprint(
-            video_info,
+            resolved_info,
             declared_size,
             "unavailable",
         )
@@ -1472,10 +1571,40 @@ class MemoryRebootPlugin(Star):
                 file_sha256 = None
                 file_size = declared_size
 
+                if not (
+                    local_path
+                    and os.path.isfile(local_path)
+                ) and not source.startswith(("http://", "https://")):
+                    fetched = await self._fetch_video_source_from_onebot(
+                        event,
+                        resolved_info,
+                    )
+                    if fetched:
+                        resolved_info.update(
+                            {
+                                key: value
+                                for key, value in fetched.items()
+                                if value
+                            }
+                        )
+                        source = str(resolved_info.get("source") or "")
+                        local_path = self._local_video_path(source)
+                        file_size = (
+                            self._parse_positive_int(resolved_info.get("size"))
+                            or declared_size
+                        )
+                        if file_size and file_size > size_limit:
+                            return self._new_video_fingerprint(
+                                resolved_info,
+                                file_size,
+                                "metadata",
+                            )
+
                 if local_path and os.path.isfile(local_path):
                     file_size = os.path.getsize(local_path)
+                    resolved_info.setdefault("source_method", "local")
                     fingerprint = self._new_video_fingerprint(
-                        video_info,
+                        resolved_info,
                         file_size,
                         "metadata" if file_size > size_limit else "sha256",
                     )
@@ -1487,8 +1616,9 @@ class MemoryRebootPlugin(Star):
                         video_path,
                     )
                 elif source.startswith(("http://", "https://")):
+                    resolved_info.setdefault("source_method", "http")
                     extension = os.path.splitext(
-                        str(video_info.get("name") or "")
+                        str(resolved_info.get("name") or "")
                     )[1]
                     if not re.fullmatch(r"\.[a-zA-Z0-9]{1,8}", extension):
                         extension = ".mp4"
@@ -1501,7 +1631,7 @@ class MemoryRebootPlugin(Star):
                         )
                     )
                     fingerprint = self._new_video_fingerprint(
-                        video_info,
+                        resolved_info,
                         file_size or declared_size,
                         "metadata" if oversize else "sha256",
                     )
@@ -1509,7 +1639,8 @@ class MemoryRebootPlugin(Star):
                         return fingerprint
                 else:
                     logger.warning(
-                        f"[Memory Reboot] 不支持的视频来源格式: {source[:200]}"
+                        "[Memory Reboot] 视频来源不可读，且未能通过 "
+                        "get_file 取回"
                     )
                     return fingerprint
 
@@ -1531,14 +1662,18 @@ class MemoryRebootPlugin(Star):
                     fingerprint["analysis"] = "perceptual"
                 return fingerprint
 
-    async def _analyze_videos(self, video_infos: List[Dict]) -> List[Dict]:
+    async def _analyze_videos(
+        self,
+        video_infos: List[Dict],
+        event: Optional[AstrMessageEvent] = None,
+    ) -> List[Dict]:
         """按消息段顺序分析普通视频，单个失败不影响其余视频。"""
         if not self._get_bool_config("video_duplicate_enabled", True):
             return []
         results = []
         for video_info in video_infos:
             try:
-                results.append(await self._analyze_video(video_info))
+                results.append(await self._analyze_video(video_info, event))
             except Exception as exc:
                 logger.error(
                     f"[Memory Reboot] 视频分析异常: "
@@ -1581,6 +1716,7 @@ class MemoryRebootPlugin(Star):
                     "width": video.get("width"),
                     "height": video.get("height"),
                     "metadata_hash": video.get("metadata_hash"),
+                    "source_method": video.get("source_method"),
                 }
             )
 
@@ -3072,7 +3208,14 @@ class MemoryRebootPlugin(Star):
             chain.append(Plain("这个话题之前已经有人讨论过了哦~"))
         chain.append(Plain(self._build_message_summary(matched_msg)))
         yield event.chain_result(chain)
-    
+
+    @staticmethod
+    def _embedding_content(result: Dict, content: str) -> str:
+        """视频消息只使用用户正文，排除插件合成的媒体标签。"""
+        if result.get("has_video"):
+            return str(result.get("video_text") or "").strip()
+        return content
+
     async def _extract_content(
         self,
         event: AstrMessageEvent,
@@ -3167,6 +3310,7 @@ class MemoryRebootPlugin(Star):
                 video_label += " " + "、".join(names)
             return {
                 "content": f"{text} {video_label}".strip(),
+                "video_text": text,
                 "image_source": None,
                 "has_image": False,
                 "has_video": True,
@@ -3318,7 +3462,7 @@ class MemoryRebootPlugin(Star):
                 f"发送者+文本指纹={'有' if forward_text_hash else '无'})"
             )
 
-        video_fingerprints = await self._analyze_videos(video_infos)
+        video_fingerprints = await self._analyze_videos(video_infos, event)
         video_matched, video_idx, video_match_type = self._find_video_match(
             messages,
             video_fingerprints,
@@ -3351,8 +3495,12 @@ class MemoryRebootPlugin(Star):
                 f"(数量={len(video_fingerprints)}, 分析={analysis_modes})"
             )
 
+        embedding_content = self._embedding_content(result, content)
+
         # 精确命中的转发无需再次生成embedding；未完整或含不可读内层
         # 的转发也不参与语义匹配，避免隐藏内容不同却被误判。
+        # 视频只允许使用用户实际输入的正文，不能把合成的文件名标签
+        # 送入Embedding，否则视频取回失败时极易产生假阳性。
         if (
             url_only
             or forward_matched
@@ -3361,8 +3509,13 @@ class MemoryRebootPlugin(Star):
             or usable_video_fingerprint
         ):
             embedding = None
+        elif has_video and not embedding_content:
+            embedding = None
+            logger.info(
+                "[Memory Reboot] 视频指纹不可用且消息无正文，跳过Embedding"
+            )
         else:
-            embedding = await self._get_embedding(content)
+            embedding = await self._get_embedding(embedding_content)
         logger.debug(f"[Memory Reboot] Embedding: {'成功获取' if embedding else '获取失败'}, 维度={len(embedding) if embedding else 0}")
         now = time.time()
         cached_image, image_hash = None, None

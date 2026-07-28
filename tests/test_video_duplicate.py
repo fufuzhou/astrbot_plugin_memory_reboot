@@ -190,6 +190,7 @@ class VideoDuplicateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(results[0]["size"], 4096)
         self.assertEqual(results[0]["name"], "content-id.mp4")
         self.assertEqual(results[0]["source"], raw_url)
+        self.assertEqual(results[0]["file_reference"], "content-id.mp4")
 
     async def test_local_video_generates_chunked_sha_without_ffmpeg(self):
         video_path = os.path.join(self.temp_dir.name, "sample.mp4")
@@ -209,6 +210,101 @@ class VideoDuplicateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["sha256"], hashlib.sha256(payload).hexdigest())
         self.assertEqual(result["size"], len(payload))
         self.assertEqual(result["frame_hashes"], [])
+        self.assertEqual(result["source_method"], "local")
+
+    async def test_missing_local_video_is_retrieved_with_onebot_file_reference(
+        self,
+    ):
+        video_path = os.path.join(self.temp_dir.name, "retrieved.mp4")
+        payload = b"retrieved-video"
+        with open(video_path, "wb") as file:
+            file.write(payload)
+        call_action = AsyncMock(
+            return_value={
+                "status": "ok",
+                "data": {
+                    "file": video_path,
+                    "url": "/napcat/inaccessible/retrieved.mp4",
+                    "file_size": str(len(payload)),
+                    "file_name": "retrieved.mp4",
+                },
+            }
+        )
+        event = types.SimpleNamespace(
+            bot=types.SimpleNamespace(call_action=call_action),
+            message_obj=types.SimpleNamespace(self_id="bot-1"),
+        )
+
+        result = await self.plugin._analyze_video(
+            {
+                "source": "/app/.config/QQ/missing/Ori/retrieved.mp4",
+                "file_reference": "napcat-context-file-code",
+                "name": "retrieved.mp4",
+                "size": len(payload),
+            },
+            event,
+        )
+
+        self.assertEqual(result["analysis"], "sha256")
+        self.assertEqual(result["sha256"], hashlib.sha256(payload).hexdigest())
+        self.assertEqual(result["source_method"], "get_file_local")
+        call_action.assert_awaited_once_with(
+            "get_file",
+            file="napcat-context-file-code",
+            self_id="bot-1",
+        )
+
+    async def test_get_file_unreadable_path_keeps_video_unavailable(self):
+        call_action = AsyncMock(
+            return_value={
+                "data": {
+                    "file": "/napcat/still-inaccessible/video.mp4",
+                    "url": "/napcat/still-inaccessible/video.mp4",
+                }
+            }
+        )
+        event = types.SimpleNamespace(
+            bot=types.SimpleNamespace(call_action=call_action),
+            message_obj=types.SimpleNamespace(),
+        )
+
+        result = await self.plugin._analyze_video(
+            {
+                "source": "/app/.config/QQ/missing/video.mp4",
+                "file_reference": "napcat-context-file-code",
+                "name": "video.mp4",
+                "size": 1024,
+            },
+            event,
+        )
+
+        self.assertEqual(result["analysis"], "unavailable")
+        self.assertIsNone(result["sha256"])
+        call_action.assert_awaited_once()
+
+    def test_video_embedding_excludes_synthetic_label_and_filename(self):
+        content = "[视频] private-name.mp4"
+
+        self.assertEqual(
+            self.plugin._embedding_content(
+                {
+                    "has_video": True,
+                    "video_text": "",
+                },
+                content,
+            ),
+            "",
+        )
+        self.assertEqual(
+            self.plugin._embedding_content(
+                {
+                    "has_video": True,
+                    "video_text": "用户输入的正文",
+                },
+                f"用户输入的正文 {content}",
+            ),
+            "用户输入的正文",
+        )
 
     async def test_local_video_promotes_to_perceptual_after_five_frames(self):
         video_path = os.path.join(self.temp_dir.name, "sample.mp4")
