@@ -15,6 +15,7 @@ import shutil
 import gzip
 import subprocess
 import tempfile
+from difflib import SequenceMatcher
 from typing import Optional, List, Dict, Tuple
 from urllib.parse import (
     parse_qs,
@@ -88,6 +89,8 @@ DEFAULT_FORWARD_MAX_DEPTH = 3             # 合并转发最大展开层数
 DEFAULT_FORWARD_MAX_FETCHES = 8           # 单条消息最多调用get_forward_msg次数
 DEFAULT_FORWARD_FETCH_TIMEOUT = 10        # 单次拉取转发资源超时（秒）
 DEFAULT_IMAGE_REPLY_CHECK_TIMEOUT = 5     # 搜图引用可用性检查超时（秒）
+DEFAULT_IMAGE_SEARCH_SEMANTIC_THRESHOLD = 0.55  # 搜图语义召回阈值
+DEFAULT_IMAGE_SEARCH_FUZZY_THRESHOLD = 0.65     # 搜图字符模糊阈值
 DEFAULT_FORWARD_MAX_NODES = 100           # 单条消息最多处理转发节点数
 DEFAULT_FORWARD_MAX_SEGMENTS = 500        # 单条消息最多处理消息段数
 DEFAULT_FORWARD_MAX_CHARS = 12000         # 单条消息最多提取文本字符数
@@ -1050,6 +1053,64 @@ class MemoryRebootPlugin(Star):
         return " ".join(str(value or "").casefold().split())
 
     @staticmethod
+    def _partial_text_similarity(query: str, text: str) -> float:
+        """计算短文本在长文本中的局部相似度，容忍少量插字和错字。"""
+        if not query or not text:
+            return 0.0
+        if query in text:
+            return 1.0
+
+        shorter, longer = (
+            (query, text)
+            if len(query) <= len(text)
+            else (text, query)
+        )
+        matcher = SequenceMatcher(None, shorter, longer)
+        best_ratio = 0.0
+        for block in matcher.get_matching_blocks():
+            start = max(block.b - block.a, 0)
+            window = longer[start:start + len(shorter)]
+            ratio = SequenceMatcher(None, shorter, window).ratio()
+            best_ratio = max(best_ratio, ratio)
+            if best_ratio >= 0.995:
+                return 1.0
+        return best_ratio
+
+    def _get_image_search_threshold(
+        self,
+        key: str,
+        default: float,
+    ) -> float:
+        """读取并限制搜图阈值到0至1。"""
+        try:
+            value = float(self.config.get(key, default))
+        except (TypeError, ValueError):
+            value = default
+        return max(0.0, min(1.0, value))
+
+    def _image_search_semantic_similarity(
+        self,
+        query_embedding: Optional[List[float]],
+        message: Dict,
+    ) -> float:
+        """比较查询向量与图片消息已有向量，维度不兼容时安全降级。"""
+        message_embedding = message.get("embedding")
+        if (
+            not query_embedding
+            or not isinstance(message_embedding, list)
+            or len(query_embedding) != len(message_embedding)
+        ):
+            return 0.0
+        try:
+            similarity = self._cosine_similarity(
+                query_embedding,
+                message_embedding,
+            )
+        except (AttributeError, TypeError, ValueError):
+            return 0.0
+        return max(0.0, min(1.0, similarity))
+
+    @staticmethod
     def _image_search_timestamp(message: Dict) -> float:
         """容忍旧记录或损坏记录中的非法时间戳。"""
         try:
@@ -1061,27 +1122,74 @@ class MemoryRebootPlugin(Star):
         self,
         messages: List[Dict],
         query: str,
+        query_embedding: Optional[List[float]] = None,
     ) -> List[Dict]:
-        """按关键词匹配图片描述，短语优先，其次按新旧排序。"""
+        """混合关键词、字符模糊度和语义相似度搜索图片描述。"""
         normalized_query = self._normalize_image_search_text(query)
         keywords = list(dict.fromkeys(normalized_query.split()))
         if not keywords:
             return []
 
+        semantic_threshold = self._get_image_search_threshold(
+            "image_search_semantic_threshold",
+            DEFAULT_IMAGE_SEARCH_SEMANTIC_THRESHOLD,
+        )
+        fuzzy_threshold = self._get_image_search_threshold(
+            "image_search_fuzzy_threshold",
+            DEFAULT_IMAGE_SEARCH_FUZZY_THRESHOLD,
+        )
         scored_matches = []
         for message in messages:
             description = self._get_image_description(message)
             normalized_description = self._normalize_image_search_text(description)
-            if not normalized_description or not all(
-                keyword in normalized_description for keyword in keywords
+            if not normalized_description:
+                continue
+
+            keyword_hits = sum(
+                keyword in normalized_description
+                for keyword in keywords
+            )
+            all_keywords_match = keyword_hits == len(keywords)
+            exact_phrase_match = normalized_query in normalized_description
+            fuzzy_similarity = self._partial_text_similarity(
+                normalized_query.replace(" ", ""),
+                normalized_description.replace(" ", ""),
+            )
+            semantic_similarity = self._image_search_semantic_similarity(
+                query_embedding,
+                message,
+            )
+            if not (
+                all_keywords_match
+                or fuzzy_similarity >= fuzzy_threshold
+                or semantic_similarity >= semantic_threshold
             ):
                 continue
 
+            if exact_phrase_match:
+                match_type = "phrase"
+            elif all_keywords_match:
+                match_type = "keywords"
+            elif semantic_similarity >= semantic_threshold:
+                match_type = "semantic"
+            else:
+                match_type = "fuzzy"
+
             result = dict(message)
             result["image_description"] = description
+            result["_image_search_match_type"] = match_type
+            result["_image_search_semantic_similarity"] = semantic_similarity
+            result["_image_search_fuzzy_similarity"] = fuzzy_similarity
             score = (
-                int(normalized_query in normalized_description),
-                sum(normalized_description.count(keyword) for keyword in keywords),
+                int(exact_phrase_match),
+                int(all_keywords_match),
+                semantic_similarity,
+                fuzzy_similarity,
+                keyword_hits / len(keywords),
+                sum(
+                    normalized_description.count(keyword)
+                    for keyword in keywords
+                ),
                 self._image_search_timestamp(message),
             )
             scored_matches.append((score, result))
@@ -4048,17 +4156,45 @@ class MemoryRebootPlugin(Star):
             yield event.plain_result("用法：/搜图 <关键词>，多个关键词请用空格分隔")
             return
 
+        messages = self._load_messages(group_id)
         matches = self._find_images_by_description(
-            self._load_messages(group_id),
+            messages,
             query,
         )
+        has_keyword_match = any(
+            match.get("_image_search_match_type") in ("phrase", "keywords")
+            for match in matches
+        )
+        has_image_descriptions = any(
+            self._get_image_description(message)
+            for message in messages
+        )
+        if (
+            not has_keyword_match
+            and has_image_descriptions
+            and self._get_bool_config("image_search_semantic_enabled", True)
+        ):
+            query_embedding = await self._get_embedding(query)
+            if query_embedding:
+                matches = self._find_images_by_description(
+                    messages,
+                    query,
+                    query_embedding,
+                )
         if not matches:
             yield event.plain_result(
-                f"🔍 没找到描述中同时包含“{query}”的图片记录"
+                f"🔍 没找到与“{query}”相关的图片记录"
             )
             return
 
         matched = matches[0]
+        logger.info(
+            "[Memory Reboot] 搜图命中: "
+            f"类型={matched.get('_image_search_match_type')}, "
+            f"语义={matched.get('_image_search_semantic_similarity', 0):.4f}, "
+            f"字符={matched.get('_image_search_fuzzy_similarity', 0):.4f}, "
+            f"候选={len(matches)}"
+        )
         description = matched["image_description"]
         if len(description) > IMAGE_SEARCH_DESCRIPTION_MAX_CHARS:
             description = (
@@ -4121,6 +4257,20 @@ class MemoryRebootPlugin(Star):
         else:
             llm_judge_status = "❌ 已禁用 (匹配即提醒)"
 
+        image_search_semantic_enabled = self._get_bool_config(
+            "image_search_semantic_enabled",
+            True,
+        )
+        embedding_provider_id = self.config.get("embedding_provider_id", "")
+        if image_search_semantic_enabled and embedding_provider_id:
+            image_search_semantic_status = (
+                f"✅ 已启用 (提供商: {embedding_provider_id})"
+            )
+        elif image_search_semantic_enabled:
+            image_search_semantic_status = "⚠️ 已启用但未配置Embedding提供商"
+        else:
+            image_search_semantic_status = "❌ 已关闭"
+
         forward_limits = self._get_forward_limits()
         judge_window_seconds, judge_max_messages = (
             self._get_judge_context_limits()
@@ -4157,6 +4307,8 @@ class MemoryRebootPlugin(Star):
 👥 最少不同用户: {self.config.get('min_unique_senders', DEFAULT_MIN_UNIQUE_SENDERS)}人
 ⏰ 冷却时间: {self.config.get('cooldown_seconds', DEFAULT_COOLDOWN_SECONDS)}秒
 📅 数据保留: {self.config.get('data_retention_days', DEFAULT_DATA_RETENTION_DAYS)}天
+🔎 搜图字符模糊阈值: {self._get_image_search_threshold('image_search_fuzzy_threshold', DEFAULT_IMAGE_SEARCH_FUZZY_THRESHOLD)}
+🧠 搜图语义阈值: {self._get_image_search_threshold('image_search_semantic_threshold', DEFAULT_IMAGE_SEARCH_SEMANTIC_THRESHOLD)}
 🧠 LLM上下文: 最近{judge_window_seconds}秒 / 历史和近期各最多{judge_max_messages}条
 🧵 转发展开: 深度{forward_limits['depth']} / 拉取{forward_limits['fetches']}次 / 单次超时{forward_limits['timeout']}秒 / 节点{forward_limits['nodes']}条
 🧱 转发内容: 消息段{forward_limits['segments']}个 / 字符{forward_limits['chars']}个
@@ -4172,6 +4324,7 @@ class MemoryRebootPlugin(Star):
 - FFmpeg/ffprobe: {ffmpeg_status}
 - 提醒图片: {'✅ 存在' if os.path.exists(img_path) else '⚠️ 不存在 (将发送纯文本)'}
 - 命令过滤: {cmd_filter_status}
+- 搜图语义检索: {image_search_semantic_status}
 - LLM判断: {llm_judge_status}"""
         yield event.plain_result(status)
     

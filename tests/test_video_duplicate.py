@@ -745,6 +745,67 @@ class VideoDuplicateTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(matches[0]["timestamp"], 200)
 
+    def test_image_description_fuzzy_search_tolerates_inserted_character(self):
+        matches = self.plugin._find_images_by_description(
+            [
+                {
+                    "image_description": "窗台上有一只橙色的猫",
+                    "timestamp": 100,
+                },
+            ],
+            "橙色猫",
+        )
+
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0]["_image_search_match_type"], "fuzzy")
+        self.assertGreaterEqual(
+            matches[0]["_image_search_fuzzy_similarity"],
+            0.65,
+        )
+
+    def test_image_description_semantic_search_uses_existing_embedding(self):
+        matches = self.plugin._find_images_by_description(
+            [
+                {
+                    "image_description": "一只猫趴在沙发上",
+                    "embedding": [1.0, 0.0],
+                    "timestamp": 100,
+                },
+                {
+                    "image_description": "一架飞机正在降落",
+                    "embedding": [0.0, 1.0],
+                    "timestamp": 200,
+                },
+            ],
+            "宠物",
+            [1.0, 0.0],
+        )
+
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0]["image_description"], "一只猫趴在沙发上")
+        self.assertEqual(matches[0]["_image_search_match_type"], "semantic")
+
+    def test_image_description_exact_match_outranks_semantic_match(self):
+        matches = self.plugin._find_images_by_description(
+            [
+                {
+                    "image_description": "宠物用品清单",
+                    "embedding": [0.0, 1.0],
+                    "timestamp": 100,
+                },
+                {
+                    "image_description": "一只猫趴在沙发上",
+                    "embedding": [1.0, 0.0],
+                    "timestamp": 200,
+                },
+            ],
+            "宠物",
+            [1.0, 0.0],
+        )
+
+        self.assertEqual(matches[0]["image_description"], "宠物用品清单")
+        self.assertEqual(matches[0]["_image_search_match_type"], "phrase")
+
     async def test_local_image_hash_does_not_create_persistent_cache(self):
         image_path = os.path.join(self.plugin.plugin_dir, "source.jpg")
         Path(image_path).write_bytes(b"image")
@@ -848,10 +909,17 @@ class VideoDuplicateTests(unittest.IsolatedAsyncioTestCase):
             def chain_result(chain):
                 return chain
 
-        with patch.object(
-            self.plugin,
-            "_load_messages",
-            return_value=[message],
+        with (
+            patch.object(
+                self.plugin,
+                "_load_messages",
+                return_value=[message],
+            ),
+            patch.object(
+                self.plugin,
+                "_get_embedding",
+                new=AsyncMock(return_value=[1.0, 0.0]),
+            ) as get_embedding,
         ):
             results = [
                 result
@@ -867,11 +935,60 @@ class VideoDuplicateTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("找到1张", chain[1].text)
         self.assertIn("橙色 猫 正在窗台晒太阳", chain[1].text)
         self.assertFalse(any(isinstance(item, _Image) for item in chain))
+        get_embedding.assert_not_awaited()
         SearchEvent.bot.call_action.assert_awaited_once_with(
             "get_msg",
             message_id="platform-message-1",
             self_id="bot-1",
         )
+
+    async def test_search_image_command_embeds_semantic_fallback_once(self):
+        group_id = "group-semantic"
+        message = {
+            "message_id": "",
+            "sender_name": "Carol",
+            "image_description": "一只猫趴在沙发上",
+            "embedding": [1.0, 0.0],
+            "timestamp": 300,
+        }
+
+        class SearchEvent:
+            message_str = "/搜图 宠物"
+
+            @staticmethod
+            def get_group_id():
+                return group_id
+
+            @staticmethod
+            def plain_result(text):
+                return ("plain", text)
+
+            @staticmethod
+            def chain_result(chain):
+                return chain
+
+        with (
+            patch.object(
+                self.plugin,
+                "_load_messages",
+                return_value=[message],
+            ),
+            patch.object(
+                self.plugin,
+                "_get_embedding",
+                new=AsyncMock(return_value=[1.0, 0.0]),
+            ) as get_embedding,
+        ):
+            results = [
+                result
+                async for result in self.plugin.search_image(
+                    SearchEvent(),
+                    "宠物",
+                )
+            ]
+
+        get_embedding.assert_awaited_once_with("宠物")
+        self.assertIn("一只猫趴在沙发上", results[0][1])
 
     async def test_search_image_command_explains_unavailable_reply(self):
         group_id = "group-4"

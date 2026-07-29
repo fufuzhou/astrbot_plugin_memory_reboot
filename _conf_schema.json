@@ -12,6 +12,24 @@
     "hint": "填写AstrBot中已配置的嵌入模型提供商ID（在AstrBot配置页面查看）。用于生成文本向量，计算消息相似度。",
     "default": ""
   },
+  "image_search_semantic_enabled": {
+    "description": "搜图启用Embedding语义检索",
+    "type": "bool",
+    "hint": "开启后每次搜图最多生成一次查询Embedding，并与图片消息已有向量比较；未配置Embedding提供商时自动退回本地关键词和字符模糊检索。",
+    "default": true
+  },
+  "image_search_semantic_threshold": {
+    "description": "搜图语义相似度阈值",
+    "type": "float",
+    "hint": "仅用于搜图语义召回，默认0.55。不同Embedding模型分数分布不同，建议结合搜图命中日志调整。",
+    "default": 0.55
+  },
+  "image_search_fuzzy_threshold": {
+    "description": "搜图字符模糊阈值",
+    "type": "float",
+    "hint": "控制插字和轻微错字的本地模糊匹配，默认0.65；提高可减少误命中，降低可扩大召回。",
+    "default": 0.65
+  },
   "vision_provider_id": {
     "description": "图像识别模型提供商【需要视觉能力】",
     "type": "string",
