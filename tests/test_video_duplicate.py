@@ -464,6 +464,32 @@ class VideoDuplicateTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("最长连续相同消息：4条", prompt)
         self.assertIn("与近期上下文重合，已省略", prompt)
 
+    def test_reminder_summary_uses_exact_and_relative_time(self):
+        matched = {
+            "sender_name": "历史发送者",
+            "timestamp": 1234567890,
+            "content": "历史消息正文",
+        }
+
+        with (
+            patch.object(
+                self.plugin,
+                "_format_time",
+                return_value="07-29 12:34:56",
+            ),
+            patch.object(
+                self.plugin,
+                "_format_time_ago",
+                return_value="5分钟前",
+            ),
+        ):
+            summary = self.plugin._build_message_summary(matched)
+
+        self.assertIn(
+            "历史发送者 · 07-29 12:34:56（5分钟前）",
+            summary,
+        )
+
     async def test_local_video_promotes_to_perceptual_after_five_frames(self):
         video_path = os.path.join(self.temp_dir.name, "sample.mp4")
         with open(video_path, "wb") as file:

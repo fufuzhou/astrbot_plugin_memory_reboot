@@ -3370,7 +3370,10 @@ class MemoryRebootPlugin(Star):
             timestamp = float(timestamp)
             if timestamp <= 0:
                 raise ValueError("无效时间戳")
-            time_text = self._format_time_ago(timestamp)
+            time_text = (
+                f"{self._format_time(timestamp)}"
+                f"（{self._format_time_ago(timestamp)}）"
+            )
         except (TypeError, ValueError, OverflowError, OSError):
             time_text = "时间未知"
 
