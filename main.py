@@ -123,6 +123,7 @@ DEFAULT_URL_TRACKING_PARAMS = [
 ]
 REMINDER_IMAGE_FILENAME = "1000101866.jpg" # 提醒图片文件名
 REMINDER_SUMMARY_MAX_CHARS = 80             # 提醒摘要正文最大长度
+IMAGE_SEARCH_DESCRIPTION_MAX_CHARS = 160   # 搜图结果中描述的最大长度
 
 
 # ==============================================================================
@@ -1056,6 +1057,96 @@ class MemoryRebootPlugin(Star):
             return 1.0 - (diff / len(bin1))
         except Exception:
             return 0.0
+
+    @staticmethod
+    def _get_image_description(message: Dict) -> str:
+        """读取独立图片描述，并兼容旧记录的内嵌格式。"""
+        description = str(message.get("image_description") or "").strip()
+        if description:
+            return description
+
+        content = str(message.get("content") or "")
+        match = re.search(r"\[图片内容:\s*(.*?)\]\s*$", content, re.DOTALL)
+        return match.group(1).strip() if match else ""
+
+    def _get_searchable_cached_image(
+        self,
+        group_id: str,
+        cached_image: object,
+    ) -> Optional[str]:
+        """只允许返回当前群图片缓存目录内实际存在的文件。"""
+        if not cached_image:
+            return None
+
+        cache_root = os.path.realpath(
+            os.path.join(self.plugin_dir, "image_cache", str(group_id))
+        )
+        candidate = os.path.realpath(str(cached_image))
+        try:
+            if os.path.normcase(os.path.commonpath([cache_root, candidate])) != (
+                os.path.normcase(cache_root)
+            ):
+                return None
+        except ValueError:
+            return None
+        return candidate if os.path.isfile(candidate) else None
+
+    @staticmethod
+    def _normalize_image_search_text(value: object) -> str:
+        """统一大小写和空白，供图片描述关键词检索使用。"""
+        return " ".join(str(value or "").casefold().split())
+
+    @staticmethod
+    def _image_search_timestamp(message: Dict) -> float:
+        """容忍旧记录或损坏记录中的非法时间戳。"""
+        try:
+            return float(message.get("timestamp") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _find_images_by_description(
+        self,
+        group_id: str,
+        messages: List[Dict],
+        query: str,
+    ) -> List[Dict]:
+        """按关键词匹配图片描述，短语优先，其次按新旧排序。"""
+        normalized_query = self._normalize_image_search_text(query)
+        keywords = list(dict.fromkeys(normalized_query.split()))
+        if not keywords:
+            return []
+
+        scored_matches = []
+        for message in messages:
+            description = self._get_image_description(message)
+            normalized_description = self._normalize_image_search_text(description)
+            if not normalized_description or not all(
+                keyword in normalized_description for keyword in keywords
+            ):
+                continue
+
+            cached_image = self._get_searchable_cached_image(
+                group_id,
+                message.get("cached_image"),
+            )
+            if not cached_image:
+                continue
+
+            result = dict(message)
+            result["image_description"] = description
+            result["cached_image"] = cached_image
+            score = (
+                int(normalized_query in normalized_description),
+                sum(normalized_description.count(keyword) for keyword in keywords),
+                self._image_search_timestamp(message),
+            )
+            scored_matches.append((score, result))
+
+        scored_matches.sort(
+            key=lambda item: item[0],
+            reverse=True,
+        )
+        return [message for _, message in scored_matches]
 
     # ==========================================================================
     # 4.7 视频处理与判重方法
@@ -3538,6 +3629,7 @@ class MemoryRebootPlugin(Star):
                     return {
                         "content": content,
                         "image_source": image_source,
+                        "image_description": img_text,
                         "has_image": True,
                     }
                 else:
@@ -3737,6 +3829,9 @@ class MemoryRebootPlugin(Star):
         # 创建当前消息记录
         msg = {
             "id": str(uuid.uuid4()),
+            "message_id": str(
+                getattr(getattr(event, "message_obj", None), "message_id", "") or ""
+            ),
             "sender_id": sender_id,
             "sender_name": sender_name,
             "content": content,
@@ -3745,6 +3840,7 @@ class MemoryRebootPlugin(Star):
             "has_image": bool(result.get("has_image")),
             "has_video": has_video,
             "cached_image": cached_image,
+            "image_description": result.get("image_description"),
             "image_hash": image_hash,
             "videos": video_fingerprints,
             "forward_id": forward_id,
@@ -3925,7 +4021,72 @@ class MemoryRebootPlugin(Star):
     # ==========================================================================
     # 4.11 命令处理器
     # ==========================================================================
-    
+
+    @staticmethod
+    def _get_image_search_query(event: AstrMessageEvent, keyword: str) -> str:
+        """提取完整命令参数，避免带空格的关键词只收到第一个词。"""
+        raw_message = str(getattr(event, "message_str", "") or "").strip()
+        command_match = re.match(
+            r"^/?搜图(?:\s+|$)(.*)$",
+            raw_message,
+            re.DOTALL,
+        )
+        if command_match:
+            return command_match.group(1).strip()
+        return raw_message or str(keyword or "").strip()
+
+    @filter.command("搜图")
+    async def search_image(
+        self,
+        event: AstrMessageEvent,
+        keyword: str = "",
+    ):
+        """在当前群已缓存图片的视觉描述中检索关键词。"""
+        group_id = event.get_group_id()
+        if not group_id:
+            yield event.plain_result("请在群聊中使用")
+            return
+
+        query = self._get_image_search_query(event, keyword)
+        if not query:
+            yield event.plain_result("用法：/搜图 <关键词>，多个关键词请用空格分隔")
+            return
+
+        matches = self._find_images_by_description(
+            str(group_id),
+            self._load_messages(group_id),
+            query,
+        )
+        if not matches:
+            yield event.plain_result(
+                f"🔍 没找到描述中同时包含“{query}”的缓存图片"
+            )
+            return
+
+        matched = matches[0]
+        description = matched["image_description"]
+        if len(description) > IMAGE_SEARCH_DESCRIPTION_MAX_CHARS:
+            description = (
+                description[:IMAGE_SEARCH_DESCRIPTION_MAX_CHARS].rstrip() + "…"
+            )
+
+        chain = []
+        message_id = str(matched.get("message_id") or "").strip()
+        if message_id:
+            chain.append(Reply(id=message_id))
+        chain.extend(
+            [
+                Image.fromFileSystem(matched["cached_image"]),
+                Plain(
+                    f"\n🔎 找到{len(matches)}张，返回最相关的一张"
+                    f"\n📝 {description}"
+                    f"\n📌 {matched.get('sender_name') or '未知用户'} · "
+                    f"{self._format_time(self._image_search_timestamp(matched))}"
+                ),
+            ]
+        )
+        yield event.chain_result(chain)
+
     @filter.command("记忆状态")
     async def check_status(self, event: AstrMessageEvent):
         """查看插件状态（仅管理员）"""

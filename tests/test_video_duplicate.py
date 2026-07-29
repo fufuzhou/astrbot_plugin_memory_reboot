@@ -122,6 +122,7 @@ class VideoDuplicateTests(unittest.IsolatedAsyncioTestCase):
         self.plugin = object.__new__(MemoryRebootPlugin)
         self.plugin.config = {}
         self.plugin.data_dir = self.temp_dir.name
+        self.plugin.plugin_dir = self.temp_dir.name
         self.plugin._video_analysis_semaphore = asyncio.Semaphore(1)
         self.plugin._ffmpeg_path = None
         self.plugin._ffprobe_path = None
@@ -705,6 +706,133 @@ class VideoDuplicateTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("private-name.mp4", serialized)
         self.assertNotIn("private.example", serialized)
+
+    def test_image_description_search_supports_old_records_and_safe_cache(self):
+        group_id = "group-1"
+        cache_dir = os.path.join(
+            self.plugin.plugin_dir,
+            "image_cache",
+            group_id,
+        )
+        os.makedirs(cache_dir)
+        legacy_image = os.path.join(cache_dir, "legacy.jpg")
+        exact_image = os.path.join(cache_dir, "exact.jpg")
+        outside_image = os.path.join(self.plugin.plugin_dir, "outside.jpg")
+        for path in (legacy_image, exact_image, outside_image):
+            Path(path).write_bytes(b"image")
+
+        messages = [
+            {
+                "content": "[图片内容: 一只橙色的猫趴在窗台]",
+                "cached_image": legacy_image,
+                "timestamp": 300,
+            },
+            {
+                "image_description": "橙色 猫 正在晒太阳",
+                "cached_image": exact_image,
+                "timestamp": 100,
+            },
+            {
+                "image_description": "橙色 猫 在缓存目录外",
+                "cached_image": outside_image,
+                "timestamp": 500,
+            },
+        ]
+
+        matches = self.plugin._find_images_by_description(
+            group_id,
+            messages,
+            "橙色 猫",
+        )
+
+        self.assertEqual(len(matches), 2)
+        self.assertEqual(matches[0]["cached_image"], exact_image)
+        self.assertEqual(matches[1]["image_description"], "一只橙色的猫趴在窗台")
+        self.assertNotIn("_image_search_score", matches[0])
+
+    def test_image_description_prefers_newest_when_scores_are_equal(self):
+        group_id = "group-2"
+        cache_dir = os.path.join(
+            self.plugin.plugin_dir,
+            "image_cache",
+            group_id,
+        )
+        os.makedirs(cache_dir)
+        older_image = os.path.join(cache_dir, "older.jpg")
+        newer_image = os.path.join(cache_dir, "newer.jpg")
+        Path(older_image).write_bytes(b"older")
+        Path(newer_image).write_bytes(b"newer")
+
+        matches = self.plugin._find_images_by_description(
+            group_id,
+            [
+                {
+                    "image_description": "Night SKY",
+                    "cached_image": older_image,
+                    "timestamp": 100,
+                },
+                {
+                    "image_description": "night   sky",
+                    "cached_image": newer_image,
+                    "timestamp": 200,
+                },
+            ],
+            "NIGHT sky",
+        )
+
+        self.assertEqual(matches[0]["cached_image"], newer_image)
+
+    async def test_search_image_command_replies_with_cached_image(self):
+        group_id = "group-3"
+        cache_dir = os.path.join(
+            self.plugin.plugin_dir,
+            "image_cache",
+            group_id,
+        )
+        os.makedirs(cache_dir)
+        image_path = os.path.join(cache_dir, "result.jpg")
+        Path(image_path).write_bytes(b"result")
+        message = {
+            "message_id": "platform-message-1",
+            "sender_name": "Alice",
+            "image_description": "橙色 猫 正在窗台晒太阳",
+            "cached_image": image_path,
+            "timestamp": 100,
+        }
+
+        class SearchEvent:
+            message_str = "/搜图 橙色 猫"
+
+            @staticmethod
+            def get_group_id():
+                return group_id
+
+            @staticmethod
+            def plain_result(text):
+                return ("plain", text)
+
+            @staticmethod
+            def chain_result(chain):
+                return chain
+
+        with patch.object(
+            self.plugin,
+            "_load_messages",
+            return_value=[message],
+        ):
+            results = [
+                result
+                async for result in self.plugin.search_image(
+                    SearchEvent(),
+                    "橙色",
+                )
+            ]
+
+        chain = results[0]
+        self.assertEqual(chain[0].id, "platform-message-1")
+        self.assertEqual(chain[1].path, image_path)
+        self.assertIn("找到1张", chain[2].text)
+        self.assertIn("橙色 猫 正在窗台晒太阳", chain[2].text)
 
 
 if __name__ == "__main__":
