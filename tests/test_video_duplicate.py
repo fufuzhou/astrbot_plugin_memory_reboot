@@ -707,101 +707,134 @@ class VideoDuplicateTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("private-name.mp4", serialized)
         self.assertNotIn("private.example", serialized)
 
-    def test_image_description_search_supports_old_records_and_safe_cache(self):
-        group_id = "group-1"
-        cache_dir = os.path.join(
-            self.plugin.plugin_dir,
-            "image_cache",
-            group_id,
-        )
-        os.makedirs(cache_dir)
-        legacy_image = os.path.join(cache_dir, "legacy.jpg")
-        exact_image = os.path.join(cache_dir, "exact.jpg")
-        outside_image = os.path.join(self.plugin.plugin_dir, "outside.jpg")
-        for path in (legacy_image, exact_image, outside_image):
-            Path(path).write_bytes(b"image")
-
+    def test_image_description_search_does_not_require_cached_files(self):
         messages = [
             {
                 "content": "[图片内容: 一只橙色的猫趴在窗台]",
-                "cached_image": legacy_image,
                 "timestamp": 300,
             },
             {
                 "image_description": "橙色 猫 正在晒太阳",
-                "cached_image": exact_image,
                 "timestamp": 100,
-            },
-            {
-                "image_description": "橙色 猫 在缓存目录外",
-                "cached_image": outside_image,
-                "timestamp": 500,
             },
         ]
 
         matches = self.plugin._find_images_by_description(
-            group_id,
             messages,
             "橙色 猫",
         )
 
         self.assertEqual(len(matches), 2)
-        self.assertEqual(matches[0]["cached_image"], exact_image)
+        self.assertEqual(matches[0]["image_description"], "橙色 猫 正在晒太阳")
         self.assertEqual(matches[1]["image_description"], "一只橙色的猫趴在窗台")
-        self.assertNotIn("_image_search_score", matches[0])
 
     def test_image_description_prefers_newest_when_scores_are_equal(self):
-        group_id = "group-2"
-        cache_dir = os.path.join(
-            self.plugin.plugin_dir,
-            "image_cache",
-            group_id,
-        )
-        os.makedirs(cache_dir)
-        older_image = os.path.join(cache_dir, "older.jpg")
-        newer_image = os.path.join(cache_dir, "newer.jpg")
-        Path(older_image).write_bytes(b"older")
-        Path(newer_image).write_bytes(b"newer")
-
         matches = self.plugin._find_images_by_description(
-            group_id,
             [
                 {
                     "image_description": "Night SKY",
-                    "cached_image": older_image,
                     "timestamp": 100,
                 },
                 {
                     "image_description": "night   sky",
-                    "cached_image": newer_image,
                     "timestamp": 200,
                 },
             ],
             "NIGHT sky",
         )
 
-        self.assertEqual(matches[0]["cached_image"], newer_image)
+        self.assertEqual(matches[0]["timestamp"], 200)
 
-    async def test_search_image_command_replies_with_cached_image(self):
-        group_id = "group-3"
-        cache_dir = os.path.join(
-            self.plugin.plugin_dir,
-            "image_cache",
-            group_id,
+    async def test_local_image_hash_does_not_create_persistent_cache(self):
+        image_path = os.path.join(self.plugin.plugin_dir, "source.jpg")
+        Path(image_path).write_bytes(b"image")
+
+        with patch.object(
+            self.plugin,
+            "_compute_image_hash",
+            return_value="image-hash",
+        ) as compute_hash:
+            result = await self.plugin._compute_image_source_hash(image_path)
+
+        self.assertEqual(result, "image-hash")
+        compute_hash.assert_called_once_with(image_path)
+        self.assertFalse(
+            os.path.exists(os.path.join(self.plugin.plugin_dir, "image_cache"))
         )
-        os.makedirs(cache_dir)
-        image_path = os.path.join(cache_dir, "result.jpg")
-        Path(image_path).write_bytes(b"result")
+
+    async def test_remote_image_hash_deletes_temporary_file(self):
+        class Response:
+            status = 200
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            @staticmethod
+            async def read():
+                return b"image"
+
+        class Session:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            @staticmethod
+            def get(_source):
+                return Response()
+
+        hashed_paths = []
+
+        def compute_hash(path):
+            self.assertTrue(os.path.isfile(path))
+            hashed_paths.append(path)
+            return "remote-image-hash"
+
+        with (
+            patch(
+                "main.aiohttp",
+                new=types.SimpleNamespace(
+                    ClientSession=lambda: Session(),
+                ),
+            ),
+            patch.object(
+                self.plugin,
+                "_compute_image_hash",
+                side_effect=compute_hash,
+            ),
+        ):
+            result = await self.plugin._compute_image_source_hash(
+                "https://example.test/image.jpg"
+            )
+
+        self.assertEqual(result, "remote-image-hash")
+        self.assertEqual(len(hashed_paths), 1)
+        self.assertFalse(os.path.exists(hashed_paths[0]))
+
+    async def test_search_image_command_replies_without_resending_image(self):
+        group_id = "group-3"
         message = {
             "message_id": "platform-message-1",
             "sender_name": "Alice",
             "image_description": "橙色 猫 正在窗台晒太阳",
-            "cached_image": image_path,
             "timestamp": 100,
         }
 
         class SearchEvent:
             message_str = "/搜图 橙色 猫"
+            message_obj = types.SimpleNamespace(self_id="bot-1")
+            bot = types.SimpleNamespace(
+                call_action=AsyncMock(
+                    return_value={
+                        "status": "ok",
+                        "data": {"message_id": "platform-message-1"},
+                    }
+                )
+            )
 
             @staticmethod
             def get_group_id():
@@ -830,9 +863,60 @@ class VideoDuplicateTests(unittest.IsolatedAsyncioTestCase):
 
         chain = results[0]
         self.assertEqual(chain[0].id, "platform-message-1")
-        self.assertEqual(chain[1].path, image_path)
-        self.assertIn("找到1张", chain[2].text)
-        self.assertIn("橙色 猫 正在窗台晒太阳", chain[2].text)
+        self.assertIsInstance(chain[1], _Plain)
+        self.assertIn("找到1张", chain[1].text)
+        self.assertIn("橙色 猫 正在窗台晒太阳", chain[1].text)
+        self.assertFalse(any(isinstance(item, _Image) for item in chain))
+        SearchEvent.bot.call_action.assert_awaited_once_with(
+            "get_msg",
+            message_id="platform-message-1",
+            self_id="bot-1",
+        )
+
+    async def test_search_image_command_explains_unavailable_reply(self):
+        group_id = "group-4"
+        message = {
+            "message_id": "404",
+            "sender_name": "Bob",
+            "image_description": "蓝色天空和白云",
+            "timestamp": 200,
+        }
+
+        class SearchEvent:
+            message_str = "/搜图 天空"
+            message_obj = types.SimpleNamespace(self_id="bot-1")
+            bot = types.SimpleNamespace(
+                call_action=AsyncMock(
+                    return_value={"status": "failed", "data": None}
+                )
+            )
+
+            @staticmethod
+            def get_group_id():
+                return group_id
+
+            @staticmethod
+            def plain_result(text):
+                return ("plain", text)
+
+            @staticmethod
+            def chain_result(chain):
+                return chain
+
+        with patch.object(
+            self.plugin,
+            "_load_messages",
+            return_value=[message],
+        ):
+            results = [
+                result
+                async for result in self.plugin.search_image(SearchEvent(), "天空")
+            ]
+
+        self.assertEqual(results[0][0], "plain")
+        self.assertIn("原消息已无法引用", results[0][1])
+        self.assertIn("蓝色天空和白云", results[0][1])
+        self.assertIn("Bob", results[0][1])
 
 
 if __name__ == "__main__":

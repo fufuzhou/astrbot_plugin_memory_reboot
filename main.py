@@ -87,6 +87,7 @@ DEFAULT_MIN_TEXT_LENGTH = 2               # 最小文本长度
 DEFAULT_FORWARD_MAX_DEPTH = 3             # 合并转发最大展开层数
 DEFAULT_FORWARD_MAX_FETCHES = 8           # 单条消息最多调用get_forward_msg次数
 DEFAULT_FORWARD_FETCH_TIMEOUT = 10        # 单次拉取转发资源超时（秒）
+DEFAULT_IMAGE_REPLY_CHECK_TIMEOUT = 5     # 搜图引用可用性检查超时（秒）
 DEFAULT_FORWARD_MAX_NODES = 100           # 单条消息最多处理转发节点数
 DEFAULT_FORWARD_MAX_SEGMENTS = 500        # 单条消息最多处理消息段数
 DEFAULT_FORWARD_MAX_CHARS = 12000         # 单条消息最多提取文本字符数
@@ -929,84 +930,55 @@ class MemoryRebootPlugin(Star):
     # 4.6 图片处理方法
     # ==========================================================================
     
-    async def _cache_image(
+    async def _compute_image_source_hash(
         self,
         image_source: str,
-        timestamp: float,
-        group_id: str
-    ) -> Tuple[Optional[str], Optional[str]]:
-        """
-        缓存远程或本地图片，同时计算感知哈希
-
-        Args:
-            image_source: 图片的HTTP(S)地址、本地路径或file URI
-            timestamp: 消息的时间戳（用于生成文件名）
-            group_id: 群组ID（用于分目录存储）
-            
-        Returns:
-            元组 (缓存文件路径, 图片哈希值)
-            如果下载或处理失败，返回 (None, None)
-        """
+    ) -> Optional[str]:
+        """计算图片哈希；远程图片仅下载到临时目录，不做长期缓存。"""
         try:
-            # 创建群组专属的缓存目录
-            cache_dir = os.path.join(self.plugin_dir, "image_cache", group_id)
-            os.makedirs(cache_dir, exist_ok=True)
-            
-            # 生成文件名: 20260202_041900_123456.jpg
-            dt = datetime.datetime.fromtimestamp(timestamp)
-            # 使用微秒部分确保文件名唯一
-            filename = dt.strftime("%Y%m%d_%H%M%S") + f"_{int((timestamp % 1) * 1000000)}.jpg"
-            filepath = os.path.join(cache_dir, filename)
-
             source = str(image_source)
             if source.startswith(("http://", "https://")):
-                # 远程图片仍通过HTTP下载
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(source) as response:
-                        if response.status != 200:
-                            logger.warning(
-                                f"[Memory Reboot] 图片下载失败: HTTP {response.status}, "
-                                f"source={source}"
-                            )
-                            return None, None
-                        with open(filepath, "wb") as f:
-                            f.write(await response.read())
+                with tempfile.TemporaryDirectory(
+                    prefix="memory_reboot_image_"
+                ) as temp_dir:
+                    temp_path = os.path.join(temp_dir, "image")
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(source) as response:
+                            if response.status != 200:
+                                logger.warning(
+                                    "[Memory Reboot] 图片下载失败: "
+                                    f"HTTP {response.status}, source={source}"
+                                )
+                                return None
+                            with open(temp_path, "wb") as file:
+                                file.write(await response.read())
+                    return self._compute_image_hash(temp_path)
+
+            # AstrBot v4.26.1会把收到的图片预处理为本地JPEG，并把
+            # Image.url/file/path都改成本地临时路径，可直接读取后计算。
+            if os.path.isabs(source):
+                local_path = source
             else:
-                # AstrBot v4.26.1会把收到的图片预处理为本地JPEG，并把
-                # Image.url/file/path都改成本地临时路径，不能再交给aiohttp。
-                if os.path.isabs(source):
+                parsed = urlparse(source)
+                if parsed.scheme == "file":
+                    local_path = url2pathname(unquote(parsed.path))
+                    if parsed.netloc:
+                        local_path = f"//{parsed.netloc}{local_path}"
+                elif not parsed.scheme:
                     local_path = source
                 else:
-                    parsed = urlparse(source)
-                    if parsed.scheme == "file":
-                        local_path = url2pathname(unquote(parsed.path))
-                        if parsed.netloc:
-                            local_path = f"//{parsed.netloc}{local_path}"
-                    elif not parsed.scheme:
-                        local_path = source
-                    else:
-                        raise ValueError(f"不支持的图片来源格式: {source}")
+                    raise ValueError(f"不支持的图片来源格式: {source}")
 
-                if not os.path.isfile(local_path):
-                    raise FileNotFoundError(f"本地图片不存在: {local_path}")
-                shutil.copy2(local_path, filepath)
-
-            logger.debug(f"[Memory Reboot] 图片缓存成功: {filename}")
-
-            # 计算图片的感知哈希
-            image_hash = self._compute_image_hash(filepath)
-            if image_hash:
-                logger.debug(f"[Memory Reboot] 图片哈希: {image_hash}")
-
-            return filepath, image_hash
+            if not os.path.isfile(local_path):
+                raise FileNotFoundError(f"本地图片不存在: {local_path}")
+            return self._compute_image_hash(local_path)
 
         except Exception as e:
             logger.error(
-                f"[Memory Reboot] 图片缓存失败: {type(e).__name__}: {e}, "
+                f"[Memory Reboot] 图片哈希计算失败: {type(e).__name__}: {e}, "
                 f"source={image_source}"
             )
-        
-        return None, None
+        return None
     
     def _compute_image_hash(self, image_path: str) -> Optional[str]:
         """
@@ -1014,9 +986,12 @@ class MemoryRebootPlugin(Star):
         """
         if HAS_PIL:
             try:
-                img = PILImage.open(image_path)
-                # 使用17x16尺寸，宽度多1用于计算差值，生成16x16=256位哈希
-                img = img.convert('L').resize((17, 16), PILImage.Resampling.LANCZOS)
+                with PILImage.open(image_path) as source:
+                    # 使用17x16尺寸，宽度多1用于计算差值，生成16x16=256位哈希
+                    img = source.convert('L').resize(
+                        (17, 16),
+                        PILImage.Resampling.LANCZOS,
+                    )
                 pixels = list(img.getdata())
                 
                 # dHash：比较相邻像素差异
@@ -1069,28 +1044,6 @@ class MemoryRebootPlugin(Star):
         match = re.search(r"\[图片内容:\s*(.*?)\]\s*$", content, re.DOTALL)
         return match.group(1).strip() if match else ""
 
-    def _get_searchable_cached_image(
-        self,
-        group_id: str,
-        cached_image: object,
-    ) -> Optional[str]:
-        """只允许返回当前群图片缓存目录内实际存在的文件。"""
-        if not cached_image:
-            return None
-
-        cache_root = os.path.realpath(
-            os.path.join(self.plugin_dir, "image_cache", str(group_id))
-        )
-        candidate = os.path.realpath(str(cached_image))
-        try:
-            if os.path.normcase(os.path.commonpath([cache_root, candidate])) != (
-                os.path.normcase(cache_root)
-            ):
-                return None
-        except ValueError:
-            return None
-        return candidate if os.path.isfile(candidate) else None
-
     @staticmethod
     def _normalize_image_search_text(value: object) -> str:
         """统一大小写和空白，供图片描述关键词检索使用。"""
@@ -1106,7 +1059,6 @@ class MemoryRebootPlugin(Star):
 
     def _find_images_by_description(
         self,
-        group_id: str,
         messages: List[Dict],
         query: str,
     ) -> List[Dict]:
@@ -1125,16 +1077,8 @@ class MemoryRebootPlugin(Star):
             ):
                 continue
 
-            cached_image = self._get_searchable_cached_image(
-                group_id,
-                message.get("cached_image"),
-            )
-            if not cached_image:
-                continue
-
             result = dict(message)
             result["image_description"] = description
-            result["cached_image"] = cached_image
             score = (
                 int(normalized_query in normalized_description),
                 sum(normalized_description.count(keyword) for keyword in keywords),
@@ -3735,7 +3679,7 @@ class MemoryRebootPlugin(Star):
         messages = self._load_messages(group_id)
         logger.debug(f"[Memory Reboot] 历史消息: {len(messages)}条（缓存）")
         
-        # 定期清理图片缓存（每100条消息触发一次）
+        # 兼容清理旧版本留下的图片缓存（每100条消息触发一次）
         if len(messages) % 100 == 0 and len(messages) > 0:
             self._cleanup_image_cache(group_id)
 
@@ -3821,10 +3765,12 @@ class MemoryRebootPlugin(Star):
             embedding = await self._get_embedding(embedding_content)
         logger.debug(f"[Memory Reboot] Embedding: {'成功获取' if embedding else '获取失败'}, 维度={len(embedding) if embedding else 0}")
         now = time.time()
-        cached_image, image_hash = None, None
+        image_hash = None
         if image_source:
-            cached_image, image_hash = await self._cache_image(image_source, now, group_id)
-            logger.debug(f"[Memory Reboot] 图片缓存: {'成功' if cached_image else '失败'}, 哈希={'有' if image_hash else '无'}")
+            image_hash = await self._compute_image_source_hash(image_source)
+            logger.debug(
+                f"[Memory Reboot] 图片哈希: {'成功' if image_hash else '失败'}"
+            )
         
         # 创建当前消息记录
         msg = {
@@ -3839,7 +3785,6 @@ class MemoryRebootPlugin(Star):
             "embedding": embedding,
             "has_image": bool(result.get("has_image")),
             "has_video": has_video,
-            "cached_image": cached_image,
             "image_description": result.get("image_description"),
             "image_hash": image_hash,
             "videos": video_fingerprints,
@@ -4035,13 +3980,64 @@ class MemoryRebootPlugin(Star):
             return command_match.group(1).strip()
         return raw_message or str(keyword or "").strip()
 
+    async def _can_reply_to_message(
+        self,
+        event: AstrMessageEvent,
+        message_id: str,
+    ) -> bool:
+        """通过OneBot get_msg确认原消息仍可引用。"""
+        if not message_id:
+            return False
+
+        bot = getattr(event, "bot", None)
+        call_action = getattr(bot, "call_action", None)
+        if not callable(call_action):
+            call_action = getattr(getattr(bot, "api", None), "call_action", None)
+        if not callable(call_action):
+            logger.info("[Memory Reboot] 搜图引用失败: 当前平台不支持get_msg")
+            return False
+
+        routing_params = {}
+        self_id = getattr(getattr(event, "message_obj", None), "self_id", None)
+        if self_id:
+            routing_params["self_id"] = self_id
+        message_id_value = int(message_id) if message_id.isdigit() else message_id
+
+        try:
+            result = await asyncio.wait_for(
+                call_action(
+                    "get_msg",
+                    message_id=message_id_value,
+                    **routing_params,
+                ),
+                timeout=DEFAULT_IMAGE_REPLY_CHECK_TIMEOUT,
+            )
+        except Exception as exc:
+            logger.info(
+                "[Memory Reboot] 搜图引用失败: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return False
+
+        if not isinstance(result, dict):
+            return False
+        if str(result.get("status") or "").lower() in ("failed", "error"):
+            return False
+        if result.get("retcode") not in (None, 0, "0"):
+            return False
+        data = result.get("data") if isinstance(result.get("data"), dict) else result
+        return any(
+            key in data
+            for key in ("message_id", "id", "message", "raw_message")
+        )
+
     @filter.command("搜图")
     async def search_image(
         self,
         event: AstrMessageEvent,
         keyword: str = "",
     ):
-        """在当前群已缓存图片的视觉描述中检索关键词。"""
+        """在当前群图片的视觉描述中检索关键词并引用原消息。"""
         group_id = event.get_group_id()
         if not group_id:
             yield event.plain_result("请在群聊中使用")
@@ -4053,13 +4049,12 @@ class MemoryRebootPlugin(Star):
             return
 
         matches = self._find_images_by_description(
-            str(group_id),
             self._load_messages(group_id),
             query,
         )
         if not matches:
             yield event.plain_result(
-                f"🔍 没找到描述中同时包含“{query}”的缓存图片"
+                f"🔍 没找到描述中同时包含“{query}”的图片记录"
             )
             return
 
@@ -4070,22 +4065,22 @@ class MemoryRebootPlugin(Star):
                 description[:IMAGE_SEARCH_DESCRIPTION_MAX_CHARS].rstrip() + "…"
             )
 
-        chain = []
         message_id = str(matched.get("message_id") or "").strip()
-        if message_id:
-            chain.append(Reply(id=message_id))
-        chain.extend(
-            [
-                Image.fromFileSystem(matched["cached_image"]),
-                Plain(
-                    f"\n🔎 找到{len(matches)}张，返回最相关的一张"
-                    f"\n📝 {description}"
-                    f"\n📌 {matched.get('sender_name') or '未知用户'} · "
-                    f"{self._format_time(self._image_search_timestamp(matched))}"
-                ),
-            ]
+        details = (
+            f"🔎 找到{len(matches)}张，返回最相关的一张"
+            f"\n📝 {description}"
+            f"\n📌 {matched.get('sender_name') or '未知用户'} · "
+            f"{self._format_time(self._image_search_timestamp(matched))}"
         )
-        yield event.chain_result(chain)
+        if await self._can_reply_to_message(event, message_id):
+            yield event.chain_result(
+                [Reply(id=message_id), Plain(f"\n{details}")]
+            )
+            return
+
+        yield event.plain_result(
+            f"⚠️ 找到了图片记录，但原消息已无法引用\n{details}"
+        )
 
     @filter.command("记忆状态")
     async def check_status(self, event: AstrMessageEvent):
