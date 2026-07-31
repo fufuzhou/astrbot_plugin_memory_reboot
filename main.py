@@ -16,7 +16,7 @@ import gzip
 import subprocess
 import tempfile
 from difflib import SequenceMatcher
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict, Set, Tuple
 from urllib.parse import (
     parse_qs,
     parse_qsl,
@@ -107,6 +107,7 @@ DEFAULT_VIDEO_FRAME_HASH_THRESHOLD = 0.90 # 视频帧平均dHash相似度阈值
 DEFAULT_VIDEO_MIN_FRAME_SIMILARITY = 0.85 # 单帧dHash最低相似度
 DEFAULT_VIDEO_DOWNLOAD_TIMEOUT = 120      # 视频下载总超时（秒）
 DEFAULT_VIDEO_PROCESS_TIMEOUT = 30        # 单次ffmpeg/ffprobe超时（秒）
+CACHE_GZIP_COMPRESSION_LEVEL = 3          # 优先降低消息落盘CPU占用
 VIDEO_FINGERPRINT_VERSION = 1             # 普通视频指纹算法版本
 VIDEO_FRAME_POSITIONS = (0.10, 0.30, 0.50, 0.70, 0.90)
 MAX_VIDEO_COMPONENTS_PER_MESSAGE = 3
@@ -177,11 +178,11 @@ class MemoryRebootPlugin(Star):
     
     性能优化:
         - 内存缓存: 消息列表缓存在内存中，避免每次从磁盘加载
-        - 增量写入: 新消息直接追加到缓存和磁盘，无需读-改-写
+        - 增量写入: 仅重写发生变化的日期分片
         - 懒加载: 仅在首次访问群组数据时从磁盘加载
     """
-    
-    # 内存缓存：{group_id: {"messages": [...], "last_load": timestamp, "dirty": bool}}
+
+    # dirty_dates记录日期分片的变更版本，防止异步写入期间漏记新消息。
     _cache: Dict[str, Dict] = {}
     
     # ==========================================================================
@@ -330,7 +331,14 @@ class MemoryRebootPlugin(Star):
     async def terminate(self):
         """插件卸载时调用"""
         for group_id in list(self._cache.keys()):
-            self._flush_cache(group_id)
+            while True:
+                cache_entry = self._cache.get(str(group_id), {})
+                dirty_before = dict(cache_entry.get("dirty_dates", {}))
+                if not dirty_before:
+                    break
+                await self._flush_cache(group_id)
+                if cache_entry.get("dirty_dates", {}) == dirty_before:
+                    break
         self._cache.clear()
         logger.info("[Memory Reboot] 资源已清理")
     
@@ -682,82 +690,141 @@ class MemoryRebootPlugin(Star):
         # 更新缓存
         self._cache[group_id] = {
             "messages": all_messages,
-            "last_load": time.time()
+            "last_load": time.time(),
+            "dirty_dates": {},
         }
         
         logger.debug(f"[Memory Reboot] 从磁盘加载 {len(all_messages)} 条消息到缓存")
         return all_messages
-    def _append_message(self, group_id: str, message: Dict):
+    async def _append_message(self, group_id: str, message: Dict):
         """
         追加单条消息（内存缓存优化版）
-        
+
         优化策略:
         - 先更新内存缓存（O(1)操作）
-        - 异步/延迟写入磁盘
+        - 在线程中延迟写入磁盘，避免阻塞事件循环
         - 使用批量写入减少I/O次数
         """
         group_id = str(group_id)
-        
+
         # 1. 更新内存缓存
         if group_id not in self._cache:
             self._cache[group_id] = {
                 "messages": [],
-                "last_load": time.time()
+                "last_load": time.time(),
+                "dirty_dates": {},
             }
-        
-        self._cache[group_id]["messages"].append(message)
-        
-        # 2. 写入磁盘（优化：每N条消息或跨天时才写入）
+
         cache_entry = self._cache[group_id]
+        cache_entry["messages"].append(message)
+
+        # 2. 写入磁盘（优化：每N条消息或跨天时才写入）
         messages = cache_entry["messages"]
-        
+
         # 获取当天的消息用于写入
-        today_str = datetime.datetime.fromtimestamp(message.get("timestamp", time.time())).strftime("%Y-%m-%d")
-        today_messages = [m for m in messages if datetime.datetime.fromtimestamp(m.get("timestamp", 0)).strftime("%Y-%m-%d") == today_str]
-        
+        today_str = self._message_date(message)
+        dirty_dates = cache_entry.setdefault("dirty_dates", {})
+        dirty_dates[today_str] = dirty_dates.get(today_str, 0) + 1
+        today_count = sum(
+            1
+            for cached_message in messages
+            if self._message_date(cached_message) == today_str
+        )
+
         # 每10条消息写入一次，或者是当天第一条消息时写入
-        should_write = len(today_messages) == 1 or len(today_messages) % 10 == 0
-        
+        should_write = today_count == 1 or today_count % 10 == 0
+
         if should_write:
-            self._write_daily_messages(group_id, today_str, today_messages)
-    
-    def _write_daily_messages(self, group_id: str, date_str: str, messages: List[Dict]):
-        """将消息写入指定日期的文件"""
+            await self._flush_cache(group_id, {today_str})
+
+    @staticmethod
+    def _message_date(message: Dict) -> str:
+        timestamp = message.get("timestamp", time.time())
+        return datetime.datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d")
+
+    def _write_daily_messages(
+        self,
+        group_id: str,
+        date_str: str,
+        messages: List[Dict],
+    ) -> bool:
+        """在线程中将单个日期分片原子写入磁盘。"""
         path = os.path.join(self._get_group_dir(group_id), f"{date_str}.json.gz")
         tmp_path = path + ".tmp"
-        
+
         try:
-            with gzip.open(tmp_path, "wt", encoding="utf-8") as f:
+            with gzip.open(
+                tmp_path,
+                "wt",
+                encoding="utf-8",
+                compresslevel=CACHE_GZIP_COMPRESSION_LEVEL,
+            ) as f:
                 json.dump(messages, f, ensure_ascii=False)
             os.replace(tmp_path, path)
+            return True
         except Exception as e:
             logger.error(f"[Memory Reboot] 写入失败: {e}")
             if os.path.exists(tmp_path):
-                try: os.remove(tmp_path)
-                except: pass
-    
-    def _flush_cache(self, group_id: str):
-        """强制将缓存写入磁盘（用于关闭前或手动保存）"""
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            return False
+
+    def _write_daily_message_batches(
+        self,
+        group_id: str,
+        grouped_messages: Dict[str, List[Dict]],
+    ) -> Set[str]:
+        """顺序写入一组日期分片，返回成功写入的日期。"""
+        return {
+            date_str
+            for date_str, messages in grouped_messages.items()
+            if self._write_daily_messages(group_id, date_str, messages)
+        }
+
+    async def _flush_cache(
+        self,
+        group_id: str,
+        only_dates: Optional[Set[str]] = None,
+    ):
+        """在线程中写入有变更的日期分片。"""
         group_id = str(group_id)
         if group_id not in self._cache:
             return
-        
-        messages = self._cache[group_id]["messages"]
-        if not messages:
+
+        cache_entry = self._cache[group_id]
+        dirty_dates = cache_entry.setdefault("dirty_dates", {})
+        target_revisions = {
+            date_str: revision
+            for date_str, revision in dirty_dates.items()
+            if only_dates is None or date_str in only_dates
+        }
+        if not target_revisions:
             return
-        
-        # 按日期分组写入
-        grouped = {}
-        for msg in messages:
-            date_str = datetime.datetime.fromtimestamp(msg.get("timestamp", 0)).strftime("%Y-%m-%d")
-            if date_str not in grouped:
-                grouped[date_str] = []
-            grouped[date_str].append(msg)
-        
-        for date_str, day_msgs in grouped.items():
-            self._write_daily_messages(group_id, date_str, day_msgs)
-        
-        logger.debug(f"[Memory Reboot] 已将群 {group_id} 的 {len(messages)} 条消息写入磁盘")
+
+        grouped_messages = {
+            date_str: []
+            for date_str in target_revisions
+        }
+        for message in cache_entry["messages"]:
+            date_str = self._message_date(message)
+            if date_str in grouped_messages:
+                grouped_messages[date_str].append(message)
+
+        successful_dates = await asyncio.to_thread(
+            self._write_daily_message_batches,
+            group_id,
+            grouped_messages,
+        )
+        for date_str in successful_dates:
+            if dirty_dates.get(date_str) == target_revisions[date_str]:
+                dirty_dates.pop(date_str, None)
+
+        logger.debug(
+            f"[Memory Reboot] 群 {group_id} 已异步写入"
+            f"{len(successful_dates)}/{len(target_revisions)}个变更分片"
+        )
     
     def _cleanup_messages(self, messages: List[Dict]) -> List[Dict]:
         """
@@ -4026,7 +4093,7 @@ class MemoryRebootPlugin(Star):
         
         if not matched_msg:
             logger.debug(f"[Memory Reboot] 未找到匹配消息，仅保存记录")
-            self._append_message(group_id, msg)
+            await self._append_message(group_id, msg)
             return
         
         # 人数检测（使用包含当前消息的列表）
@@ -4076,12 +4143,12 @@ class MemoryRebootPlugin(Star):
         
         if sender_id == matched_msg.get("sender_id"):
             logger.debug(f"[Memory Reboot] ✗ 跳过: 同一用户({sender_name})重发自己的内容")
-            self._append_message(group_id, msg)
+            await self._append_message(group_id, msg)
             return
         
         if unique_count < min_unique_senders:
             logger.debug(f"[Memory Reboot] ✗ 跳过: 不同用户数{unique_count}<{min_unique_senders}(阈值)")
-            self._append_message(group_id, msg)
+            await self._append_message(group_id, msg)
             return
         
         logger.debug(f"[Memory Reboot] ✓ 通过人数检测: {unique_count}人>={min_unique_senders}人")
@@ -4091,7 +4158,7 @@ class MemoryRebootPlugin(Star):
         cooldown = self.config.get("cooldown_seconds", DEFAULT_COOLDOWN_SECONDS)
         if time_diff < cooldown:
             logger.debug(f"[Memory Reboot] ✗ 跳过: 冷却时间内({int(time_diff)}s<{cooldown}s)")
-            self._append_message(group_id, msg)
+            await self._append_message(group_id, msg)
             return
         
         logger.debug(f"[Memory Reboot] ✓ 通过冷却检测: 间隔{int(time_diff)}s>={cooldown}s")
@@ -4130,7 +4197,7 @@ class MemoryRebootPlugin(Star):
             logger.debug(f"[Memory Reboot] LLM判断已关闭，直接触发提醒")
             should_remind = True
 
-        self._append_message(group_id, msg)
+        await self._append_message(group_id, msg)
 
         if should_remind:
             logger.info(f"[Memory Reboot] 最终判断: 触发提醒 -> {sender_name}")

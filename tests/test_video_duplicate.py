@@ -1,4 +1,5 @@
 import asyncio
+import gzip
 import hashlib
 import json
 import os
@@ -123,12 +124,108 @@ class VideoDuplicateTests(unittest.IsolatedAsyncioTestCase):
         self.plugin.config = {}
         self.plugin.data_dir = self.temp_dir.name
         self.plugin.plugin_dir = self.temp_dir.name
+        self.plugin._cache = {}
         self.plugin._video_analysis_semaphore = asyncio.Semaphore(1)
         self.plugin._ffmpeg_path = None
         self.plugin._ffprobe_path = None
 
     def tearDown(self):
         self.temp_dir.cleanup()
+
+    async def test_terminate_does_not_rewrite_clean_cache(self):
+        self.plugin._cache["group-1"] = {
+            "messages": [{"timestamp": time.time(), "content": "loaded"}],
+            "last_load": time.time(),
+            "dirty_dates": {},
+        }
+
+        with patch.object(
+            self.plugin,
+            "_write_daily_message_batches",
+        ) as write_batches:
+            await self.plugin.terminate()
+
+        write_batches.assert_not_called()
+        self.assertEqual(self.plugin._cache, {})
+
+    async def test_terminate_writes_only_dirty_date(self):
+        current_timestamp = time.time()
+        current_date = self.plugin._message_date(
+            {"timestamp": current_timestamp}
+        )
+        old_timestamp = current_timestamp - 86400
+        old_date = self.plugin._message_date({"timestamp": old_timestamp})
+        current_messages = [
+            {"timestamp": current_timestamp, "content": "current"}
+        ]
+        self.plugin._cache["group-2"] = {
+            "messages": [
+                {"timestamp": old_timestamp, "content": "old"},
+                *current_messages,
+            ],
+            "last_load": time.time(),
+            "dirty_dates": {current_date: 1},
+        }
+
+        await self.plugin.terminate()
+
+        current_path = os.path.join(
+            self.temp_dir.name,
+            "group-2",
+            f"{current_date}.json.gz",
+        )
+        old_path = os.path.join(
+            self.temp_dir.name,
+            "group-2",
+            f"{old_date}.json.gz",
+        )
+        with gzip.open(current_path, "rt", encoding="utf-8") as file:
+            saved_messages = json.load(file)
+
+        self.assertEqual(saved_messages, current_messages)
+        self.assertFalse(os.path.exists(old_path))
+
+    async def test_append_offloads_periodic_write_from_event_loop(self):
+        timestamp = time.time()
+        date_str = self.plugin._message_date({"timestamp": timestamp})
+        to_thread_result = {date_str}
+
+        with patch(
+            "main.asyncio.to_thread",
+            new=AsyncMock(return_value=to_thread_result),
+        ) as to_thread:
+            await self.plugin._append_message(
+                "group-3",
+                {"timestamp": timestamp, "content": "first"},
+            )
+
+        to_thread.assert_awaited_once()
+        self.assertEqual(
+            self.plugin._cache["group-3"]["dirty_dates"],
+            {},
+        )
+
+    async def test_flush_keeps_new_revision_dirty_during_write(self):
+        timestamp = time.time()
+        date_str = self.plugin._message_date({"timestamp": timestamp})
+        cache_entry = {
+            "messages": [{"timestamp": timestamp, "content": "first"}],
+            "last_load": time.time(),
+            "dirty_dates": {date_str: 1},
+        }
+        self.plugin._cache["group-4"] = cache_entry
+
+        async def finish_after_new_message(_function, *_args):
+            cache_entry["dirty_dates"][date_str] = 2
+            return {date_str}
+
+        with patch(
+            "main.asyncio.to_thread",
+            new=AsyncMock(side_effect=finish_after_new_message),
+        ):
+            await self.plugin._flush_cache("group-4")
+
+        self.assertEqual(cache_entry["dirty_dates"], {date_str: 2})
 
     @staticmethod
     def _video(
