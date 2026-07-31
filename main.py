@@ -1412,9 +1412,13 @@ class MemoryRebootPlugin(Star):
             component_path = str(getattr(component, "path", None) or "")
             component_url = str(getattr(component, "url", None) or "").strip()
             raw_url = str(raw_data.get("url") or "").strip()
+            component_file = str(
+                getattr(component, "file", None) or ""
+            ).strip()
+            raw_file = str(raw_data.get("file") or "").strip()
             file_reference = (
-                raw_data.get("file")
-                or getattr(component, "file", None)
+                raw_file
+                or component_file
             )
             local_component_path = self._local_video_path(component_path)
             if (
@@ -1429,11 +1433,11 @@ class MemoryRebootPlugin(Star):
             elif component_url:
                 source = component_url
                 source_method = "component_url"
-            elif getattr(component, "file", None):
-                source = getattr(component, "file")
+            elif component_file:
+                source = component_file
                 source_method = "component_file"
             else:
-                source = raw_data.get("file")
+                source = raw_file
                 source_method = "raw_file"
             name_source = (
                 raw_data.get("file")
@@ -1459,6 +1463,14 @@ class MemoryRebootPlugin(Star):
                         and component_url
                         and raw_url != component_url
                     ),
+                    "_debug_source_candidates": {
+                        "component_path": component_path or None,
+                        "component_url": component_url or None,
+                        "component_file": component_file or None,
+                        "raw_url": raw_url or None,
+                        "raw_file": raw_file or None,
+                        "file_reference": str(file_reference or "") or None,
+                    },
                 }
             )
 
@@ -1532,6 +1544,17 @@ class MemoryRebootPlugin(Star):
             data.get("file_name")
         )
         file_source = str(data.get("file") or "").strip()
+        response_url = str(data.get("url") or "").strip()
+        debug_sources = video_info.setdefault(
+            "_debug_source_candidates",
+            {},
+        )
+        debug_sources.update(
+            {
+                "get_file_file": file_source or None,
+                "get_file_url": response_url or None,
+            }
+        )
         local_path = self._local_video_path(file_source)
         if local_path and os.path.isfile(local_path):
             return {
@@ -1594,6 +1617,10 @@ class MemoryRebootPlugin(Star):
     ) -> Dict:
         filename = str(video_info.get("name") or "")
         source = str(video_info.get("source") or "").strip()
+        debug_source_candidates = dict(
+            video_info.get("_debug_source_candidates") or {}
+        )
+        debug_source_candidates["selected_source"] = source or None
         return {
             "version": VIDEO_FINGERPRINT_VERSION,
             "name": filename,
@@ -1614,12 +1641,46 @@ class MemoryRebootPlugin(Star):
             "analysis": analysis,
             "source_method": video_info.get("source_method", "unavailable"),
             "source_conflict": bool(video_info.get("source_conflict")),
+            "size_mismatch": False,
+            "size_delta_bytes": None,
+            "size_ratio": None,
             "_debug_source_url": (
                 source
                 if source.startswith(("http://", "https://"))
                 else None
             ),
+            "_debug_source_candidates": debug_source_candidates,
         }
+
+    @staticmethod
+    def _is_message_bound_video_source(video_info: Dict) -> bool:
+        """判断来源是否由当前消息的组件或get_file直接绑定。"""
+        return video_info.get("source_method") in {
+            "component_path",
+            "get_file_local",
+            "get_file_http",
+        }
+
+    @staticmethod
+    def _set_video_size_diagnostics(
+        fingerprint: Dict,
+        declared_size: Optional[int],
+        actual_size: Optional[int],
+    ) -> bool:
+        """记录声明/实际大小差异，并返回是否不一致。"""
+        mismatch = bool(
+            declared_size
+            and actual_size
+            and declared_size != actual_size
+        )
+        fingerprint["size_mismatch"] = mismatch
+        if mismatch:
+            fingerprint["size_delta_bytes"] = actual_size - declared_size
+            fingerprint["size_ratio"] = round(
+                actual_size / declared_size,
+                6,
+            )
+        return mismatch
 
     async def _download_video(
         self,
@@ -1845,22 +1906,37 @@ class MemoryRebootPlugin(Star):
                             or declared_size
                         )
                         if file_size and file_size > size_limit:
-                            if declared_size and file_size != declared_size:
+                            fingerprint = self._new_video_fingerprint(
+                                resolved_info,
+                                file_size,
+                                "metadata",
+                            )
+                            size_mismatch = (
+                                self._set_video_size_diagnostics(
+                                    fingerprint,
+                                    declared_size,
+                                    file_size,
+                                )
+                            )
+                            if (
+                                size_mismatch
+                                and not self._is_message_bound_video_source(
+                                    resolved_info
+                                )
+                            ):
                                 logger.warning(
                                     "[Memory Reboot] 视频声明大小与 get_file "
                                     f"返回大小不一致，拒绝生成指纹 "
                                     f"(声明={declared_size}, 返回={file_size})"
                                 )
-                                return self._new_video_fingerprint(
-                                    resolved_info,
-                                    file_size,
-                                    "unavailable",
+                                fingerprint["analysis"] = "unavailable"
+                            elif size_mismatch:
+                                logger.warning(
+                                    "[Memory Reboot] 视频声明大小与消息绑定的 "
+                                    "get_file结果不一致，继续使用返回大小 "
+                                    f"(声明={declared_size}, 返回={file_size})"
                                 )
-                            return self._new_video_fingerprint(
-                                resolved_info,
-                                file_size,
-                                "metadata",
-                            )
+                            return fingerprint
 
                 if local_path and os.path.isfile(local_path):
                     file_size = os.path.getsize(local_path)
@@ -1870,14 +1946,27 @@ class MemoryRebootPlugin(Star):
                         file_size,
                         "metadata" if file_size > size_limit else "sha256",
                     )
-                    if declared_size and file_size != declared_size:
+                    size_mismatch = self._set_video_size_diagnostics(
+                        fingerprint,
+                        declared_size,
+                        file_size,
+                    )
+                    if size_mismatch:
+                        if not self._is_message_bound_video_source(
+                            resolved_info
+                        ):
+                            logger.warning(
+                                "[Memory Reboot] 视频声明大小与实际文件大小"
+                                "不一致，拒绝生成指纹 "
+                                f"(声明={declared_size}, 实际={file_size})"
+                            )
+                            fingerprint["analysis"] = "unavailable"
+                            return fingerprint
                         logger.warning(
-                            "[Memory Reboot] 视频声明大小与实际文件大小不一致，"
-                            f"拒绝生成指纹 (声明={declared_size}, "
-                            f"实际={file_size})"
+                            "[Memory Reboot] 视频声明大小与消息绑定文件大小"
+                            "不一致，继续使用实际文件生成指纹 "
+                            f"(声明={declared_size}, 实际={file_size})"
                         )
-                        fingerprint["analysis"] = "unavailable"
-                        return fingerprint
                     if file_size > size_limit:
                         return fingerprint
                     video_path = local_path
@@ -1905,18 +1994,27 @@ class MemoryRebootPlugin(Star):
                         file_size or declared_size,
                         "metadata" if oversize else "sha256",
                     )
-                    if (
-                        declared_size
-                        and file_size
-                        and file_size != declared_size
-                    ):
+                    size_mismatch = self._set_video_size_diagnostics(
+                        fingerprint,
+                        declared_size,
+                        file_size,
+                    )
+                    if size_mismatch:
+                        if not self._is_message_bound_video_source(
+                            resolved_info
+                        ):
+                            logger.warning(
+                                "[Memory Reboot] 视频声明大小与下载大小"
+                                "不一致，拒绝生成指纹 "
+                                f"(声明={declared_size}, 下载={file_size})"
+                            )
+                            fingerprint["analysis"] = "unavailable"
+                            return fingerprint
                         logger.warning(
-                            "[Memory Reboot] 视频声明大小与下载大小不一致，"
-                            f"拒绝生成指纹 (声明={declared_size}, "
-                            f"下载={file_size})"
+                            "[Memory Reboot] 视频声明大小与消息绑定下载大小"
+                            "不一致，继续使用下载内容生成指纹 "
+                            f"(声明={declared_size}, 下载={file_size})"
                         )
-                        fingerprint["analysis"] = "unavailable"
-                        return fingerprint
                     if oversize or not file_sha256:
                         return fingerprint
                 else:
@@ -1924,7 +2022,11 @@ class MemoryRebootPlugin(Star):
                         "[Memory Reboot] 视频来源不可读，且未能通过 "
                         "get_file 取回"
                     )
-                    return fingerprint
+                    return self._new_video_fingerprint(
+                        resolved_info,
+                        declared_size,
+                        "unavailable",
+                    )
 
                 fingerprint["sha256"] = file_sha256
                 if not file_sha256 or not video_path:
@@ -2001,7 +2103,13 @@ class MemoryRebootPlugin(Star):
                     "metadata_hash": video.get("metadata_hash"),
                     "source_method": video.get("source_method"),
                     "source_conflict": video.get("source_conflict"),
+                    "size_mismatch": video.get("size_mismatch"),
+                    "size_delta_bytes": video.get("size_delta_bytes"),
+                    "size_ratio": video.get("size_ratio"),
                     "source_url": video.get("_debug_source_url"),
+                    "source_candidates": video.get(
+                        "_debug_source_candidates"
+                    ),
                 }
             )
 
@@ -2037,7 +2145,7 @@ class MemoryRebootPlugin(Star):
         log_id = str(message_id or "unknown")
         logger.info(
             "[Memory Reboot][VideoDebug] 视频指纹诊断已启用；"
-            f"不包含视频URL、路径、文件名或正文。id={log_id}, "
+            f"包含来源URL、路径和资源标识，不包含正文。id={log_id}, "
             f"分段={total_chunks}"
         )
         for index in range(total_chunks):
@@ -3965,6 +4073,7 @@ class MemoryRebootPlugin(Star):
             )
         for video in video_fingerprints:
             video.pop("_debug_source_url", None)
+            video.pop("_debug_source_candidates", None)
         usable_video_fingerprint = any(
             video.get("sha256")
             or video.get("frame_hashes")

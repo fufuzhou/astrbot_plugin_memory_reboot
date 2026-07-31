@@ -293,6 +293,17 @@ class VideoDuplicateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(results[0]["declared_size"], 4096)
         self.assertEqual(results[0]["source_method"], "raw_url")
         self.assertTrue(results[0]["source_conflict"])
+        self.assertEqual(
+            results[0]["_debug_source_candidates"],
+            {
+                "component_path": None,
+                "component_url": "https://stale.example/old-video.mp4",
+                "component_file": "opaque.mp4",
+                "raw_url": raw_url,
+                "raw_file": "content-id.mp4",
+                "file_reference": "content-id.mp4",
+            },
+        )
 
     async def test_local_video_generates_chunked_sha_without_ffmpeg(self):
         video_path = os.path.join(self.temp_dir.name, "sample.mp4")
@@ -359,6 +370,7 @@ class VideoDuplicateTests(unittest.IsolatedAsyncioTestCase):
     async def test_http_video_prefers_message_bound_get_file_local_source(self):
         video_path = os.path.join(self.temp_dir.name, "current.mp4")
         payload = b"current-message-video"
+        declared_size = len(payload) + 100
         with open(video_path, "wb") as file:
             file.write(payload)
         call_action = AsyncMock(
@@ -382,8 +394,11 @@ class VideoDuplicateTests(unittest.IsolatedAsyncioTestCase):
                 "source": "https://example.test/current.mp4",
                 "file_reference": "current-message-file-code",
                 "name": "current.mp4",
-                "size": len(payload),
+                "size": declared_size,
                 "source_method": "raw_url",
+                "_debug_source_candidates": {
+                    "raw_url": "https://example.test/current.mp4",
+                },
             },
             event,
         )
@@ -391,6 +406,19 @@ class VideoDuplicateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["analysis"], "sha256")
         self.assertEqual(result["sha256"], hashlib.sha256(payload).hexdigest())
         self.assertEqual(result["source_method"], "get_file_local")
+        self.assertTrue(result["size_mismatch"])
+        self.assertEqual(
+            result["size_delta_bytes"],
+            len(payload) - declared_size,
+        )
+        self.assertEqual(
+            result["_debug_source_candidates"]["get_file_url"],
+            "https://stale.example/old-video.mp4",
+        )
+        self.assertEqual(
+            result["_debug_source_candidates"]["selected_source"],
+            video_path,
+        )
         self.plugin._download_video.assert_not_awaited()
         call_action.assert_awaited_once_with(
             "get_file",
@@ -415,6 +443,8 @@ class VideoDuplicateTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result["sha256"])
         self.assertEqual(result["size"], len(payload))
         self.assertEqual(result["declared_size"], len(payload) + 1)
+        self.assertTrue(result["size_mismatch"])
+        self.assertEqual(result["size_delta_bytes"], -1)
 
     async def test_get_file_unreadable_path_keeps_video_unavailable(self):
         call_action = AsyncMock(
@@ -816,7 +846,7 @@ class VideoDuplicateTests(unittest.IsolatedAsyncioTestCase):
             )
         test_logger.info.assert_not_called()
 
-    def test_video_debug_log_outputs_reconstructable_safe_fingerprints(self):
+    def test_video_debug_log_outputs_source_diagnostics(self):
         self.plugin.config["video_debug_log"] = "true"
         event = types.SimpleNamespace(
             message_obj=types.SimpleNamespace(message_id="message-2")
@@ -836,7 +866,16 @@ class VideoDuplicateTests(unittest.IsolatedAsyncioTestCase):
             "metadata_hash": "c" * 64,
             "source_method": "get_file_local",
             "source_conflict": True,
+            "size_mismatch": True,
+            "size_delta_bytes": -100,
+            "size_ratio": 0.925,
             "_debug_source_url": "https://private.example/video.mp4",
+            "_debug_source_candidates": {
+                "raw_url": "https://raw.example/video.mp4",
+                "get_file_file": "/shared/current.mp4",
+                "get_file_url": "https://private.example/video.mp4",
+                "selected_source": "/shared/current.mp4",
+            },
         }
         matched = {"id": "stored-record"}
 
@@ -883,6 +922,14 @@ class VideoDuplicateTests(unittest.IsolatedAsyncioTestCase):
             payload["fingerprints"][0]["source_url"],
             "https://private.example/video.mp4",
         )
+        self.assertEqual(
+            payload["fingerprints"][0]["source_candidates"],
+            video["_debug_source_candidates"],
+        )
+        self.assertTrue(
+            payload["fingerprints"][0]["size_mismatch"]
+        )
+        self.assertIn("包含来源URL、路径和资源标识", lines[0])
         self.assertNotIn("private-name.mp4", serialized)
         self.assertIn("private.example", serialized)
 
