@@ -1343,6 +1343,8 @@ class MemoryRebootPlugin(Star):
         ):
             raw_data = raw_segments[index] if index < len(raw_segments) else {}
             component_path = str(getattr(component, "path", None) or "")
+            component_url = str(getattr(component, "url", None) or "").strip()
+            raw_url = str(raw_data.get("url") or "").strip()
             file_reference = (
                 raw_data.get("file")
                 or getattr(component, "file", None)
@@ -1353,18 +1355,28 @@ class MemoryRebootPlugin(Star):
                 and os.path.isfile(local_component_path)
             ):
                 source = component_path
+                source_method = "component_path"
+            elif raw_url:
+                source = raw_url
+                source_method = "raw_url"
+            elif component_url:
+                source = component_url
+                source_method = "component_url"
+            elif getattr(component, "file", None):
+                source = getattr(component, "file")
+                source_method = "component_file"
             else:
-                source = (
-                    getattr(component, "url", None)
-                    or raw_data.get("url")
-                    or getattr(component, "file", None)
-                    or raw_data.get("file")
-                )
+                source = raw_data.get("file")
+                source_method = "raw_file"
             name_source = (
                 raw_data.get("file")
                 or raw_data.get("file_name")
                 or raw_data.get("name")
                 or source
+            )
+            declared_size = self._parse_positive_int(
+                raw_data.get("file_size")
+                or raw_data.get("size")
             )
             results.append(
                 {
@@ -1372,9 +1384,13 @@ class MemoryRebootPlugin(Star):
                     "source": str(source or ""),
                     "file_reference": str(file_reference or ""),
                     "name": self._normalize_video_filename(name_source),
-                    "size": self._parse_positive_int(
-                        raw_data.get("file_size")
-                        or raw_data.get("size")
+                    "size": declared_size,
+                    "declared_size": declared_size,
+                    "source_method": source_method,
+                    "source_conflict": bool(
+                        raw_url
+                        and component_url
+                        and raw_url != component_url
                     ),
                 }
             )
@@ -1448,6 +1464,16 @@ class MemoryRebootPlugin(Star):
         response_name = self._normalize_video_filename(
             data.get("file_name")
         )
+        file_source = str(data.get("file") or "").strip()
+        local_path = self._local_video_path(file_source)
+        if local_path and os.path.isfile(local_path):
+            return {
+                "source": file_source,
+                "source_method": "get_file_local",
+                "size": response_size,
+                "name": response_name,
+            }
+
         for candidate in (data.get("url"), data.get("file")):
             source = str(candidate or "").strip()
             if not source:
@@ -1456,14 +1482,6 @@ class MemoryRebootPlugin(Star):
                 return {
                     "source": source,
                     "source_method": "get_file_http",
-                    "size": response_size,
-                    "name": response_name,
-                }
-            local_path = self._local_video_path(source)
-            if local_path and os.path.isfile(local_path):
-                return {
-                    "source": source,
-                    "source_method": "get_file_local",
                     "size": response_size,
                     "name": response_name,
                 }
@@ -1512,6 +1530,10 @@ class MemoryRebootPlugin(Star):
             "version": VIDEO_FINGERPRINT_VERSION,
             "name": filename,
             "size": file_size,
+            "declared_size": self._parse_positive_int(
+                video_info.get("declared_size")
+                or video_info.get("size")
+            ),
             "sha256": None,
             "frame_hashes": [],
             "duration_ms": None,
@@ -1523,6 +1545,7 @@ class MemoryRebootPlugin(Star):
             ),
             "analysis": analysis,
             "source_method": video_info.get("source_method", "unavailable"),
+            "source_conflict": bool(video_info.get("source_conflict")),
         }
 
     async def _download_video(
@@ -1698,7 +1721,11 @@ class MemoryRebootPlugin(Star):
     ) -> Dict:
         """在大小限制内生成视频精确和感知指纹。"""
         resolved_info = dict(video_info)
-        declared_size = self._parse_positive_int(resolved_info.get("size"))
+        declared_size = self._parse_positive_int(
+            resolved_info.get("declared_size")
+            or resolved_info.get("size")
+        )
+        resolved_info["declared_size"] = declared_size
         fingerprint = self._new_video_fingerprint(
             resolved_info,
             declared_size,
@@ -1724,9 +1751,8 @@ class MemoryRebootPlugin(Star):
                 file_size = declared_size
 
                 if not (
-                    local_path
-                    and os.path.isfile(local_path)
-                ) and not source.startswith(("http://", "https://")):
+                    local_path and os.path.isfile(local_path)
+                ) and resolved_info.get("file_reference"):
                     fetched = await self._fetch_video_source_from_onebot(
                         event,
                         resolved_info,
@@ -1746,6 +1772,17 @@ class MemoryRebootPlugin(Star):
                             or declared_size
                         )
                         if file_size and file_size > size_limit:
+                            if declared_size and file_size != declared_size:
+                                logger.warning(
+                                    "[Memory Reboot] 视频声明大小与 get_file "
+                                    f"返回大小不一致，拒绝生成指纹 "
+                                    f"(声明={declared_size}, 返回={file_size})"
+                                )
+                                return self._new_video_fingerprint(
+                                    resolved_info,
+                                    file_size,
+                                    "unavailable",
+                                )
                             return self._new_video_fingerprint(
                                 resolved_info,
                                 file_size,
@@ -1760,6 +1797,14 @@ class MemoryRebootPlugin(Star):
                         file_size,
                         "metadata" if file_size > size_limit else "sha256",
                     )
+                    if declared_size and file_size != declared_size:
+                        logger.warning(
+                            "[Memory Reboot] 视频声明大小与实际文件大小不一致，"
+                            f"拒绝生成指纹 (声明={declared_size}, "
+                            f"实际={file_size})"
+                        )
+                        fingerprint["analysis"] = "unavailable"
+                        return fingerprint
                     if file_size > size_limit:
                         return fingerprint
                     video_path = local_path
@@ -1787,6 +1832,18 @@ class MemoryRebootPlugin(Star):
                         file_size or declared_size,
                         "metadata" if oversize else "sha256",
                     )
+                    if (
+                        declared_size
+                        and file_size
+                        and file_size != declared_size
+                    ):
+                        logger.warning(
+                            "[Memory Reboot] 视频声明大小与下载大小不一致，"
+                            f"拒绝生成指纹 (声明={declared_size}, "
+                            f"下载={file_size})"
+                        )
+                        fingerprint["analysis"] = "unavailable"
+                        return fingerprint
                     if oversize or not file_sha256:
                         return fingerprint
                 else:
@@ -1862,6 +1919,7 @@ class MemoryRebootPlugin(Star):
                     "version": video.get("version"),
                     "analysis": video.get("analysis"),
                     "size": video.get("size"),
+                    "declared_size": video.get("declared_size"),
                     "sha256": video.get("sha256"),
                     "frame_hashes": video.get("frame_hashes") or [],
                     "duration_ms": video.get("duration_ms"),
@@ -1869,6 +1927,7 @@ class MemoryRebootPlugin(Star):
                     "height": video.get("height"),
                     "metadata_hash": video.get("metadata_hash"),
                     "source_method": video.get("source_method"),
+                    "source_conflict": video.get("source_conflict"),
                 }
             )
 

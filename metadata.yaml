@@ -12,6 +12,6 @@ help: |
   自动过滤其他插件的命令，避免误判
   管理命令仅限管理员使用
   优化正则匹配策略为全词匹配，支持精准关键词过滤
-version: v3.10.0
+version: v3.10.1
 author: s11IM、idiotsj
 repo: https://github.com/s11IM/astrbot_plugin_memory_reboot
