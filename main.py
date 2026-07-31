@@ -1526,6 +1526,7 @@ class MemoryRebootPlugin(Star):
         analysis: str,
     ) -> Dict:
         filename = str(video_info.get("name") or "")
+        source = str(video_info.get("source") or "").strip()
         return {
             "version": VIDEO_FINGERPRINT_VERSION,
             "name": filename,
@@ -1546,6 +1547,11 @@ class MemoryRebootPlugin(Star):
             "analysis": analysis,
             "source_method": video_info.get("source_method", "unavailable"),
             "source_conflict": bool(video_info.get("source_conflict")),
+            "_debug_source_url": (
+                source
+                if source.startswith(("http://", "https://"))
+                else None
+            ),
         }
 
     async def _download_video(
@@ -1905,7 +1911,7 @@ class MemoryRebootPlugin(Star):
         match_type: Optional[str],
         matched_message: Optional[Dict],
     ) -> None:
-        """分段输出视频处理结果，不记录视频URL、路径或文件名。"""
+        """分段输出视频处理结果；调试开关启用时包含所用HTTP URL。"""
         if not self._is_video_debug_enabled():
             return
 
@@ -1928,6 +1934,7 @@ class MemoryRebootPlugin(Star):
                     "metadata_hash": video.get("metadata_hash"),
                     "source_method": video.get("source_method"),
                     "source_conflict": video.get("source_conflict"),
+                    "source_url": video.get("_debug_source_url"),
                 }
             )
 
@@ -3889,6 +3896,8 @@ class MemoryRebootPlugin(Star):
                 video_match_type,
                 video_matched,
             )
+        for video in video_fingerprints:
+            video.pop("_debug_source_url", None)
         usable_video_fingerprint = any(
             video.get("sha256")
             or video.get("frame_hashes")

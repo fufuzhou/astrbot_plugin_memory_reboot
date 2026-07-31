@@ -739,6 +739,7 @@ class VideoDuplicateTests(unittest.IsolatedAsyncioTestCase):
             "metadata_hash": "c" * 64,
             "source_method": "get_file_local",
             "source_conflict": True,
+            "_debug_source_url": "https://private.example/video.mp4",
         }
         matched = {"id": "stored-record"}
 
@@ -781,8 +782,12 @@ class VideoDuplicateTests(unittest.IsolatedAsyncioTestCase):
             payload["fingerprints"][0]["declared_size"],
             1234,
         )
+        self.assertEqual(
+            payload["fingerprints"][0]["source_url"],
+            "https://private.example/video.mp4",
+        )
         self.assertNotIn("private-name.mp4", serialized)
-        self.assertNotIn("private.example", serialized)
+        self.assertIn("private.example", serialized)
 
     def test_image_description_search_does_not_require_cached_files(self):
         messages = [
