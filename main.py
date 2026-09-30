@@ -323,6 +323,10 @@ class MemoryRebootPlugin(Star):
         # 初始化内存缓存
         self._cache = {}
         self._video_analysis_semaphore = asyncio.Semaphore(1)
+        # None=尚未探测；True=协议端可用；False=已确认 get_file 不支持视频。
+        # SnowLuma 当前的 get_file 仅解析图片/语音缓存，若每条视频都继续
+        # 尝试会产生无意义 ActionFailed/WARN。能力按插件生命周期缓存即可。
+        self._video_get_file_supported = None
         self._ffmpeg_path, self._ffprobe_path = self._resolve_ffmpeg_tools()
 
         logger.info("[Memory Reboot] 插件初始化完成（含内存缓存优化）")
@@ -1396,6 +1400,15 @@ class MemoryRebootPlugin(Star):
             return data
         return result if isinstance(result, dict) else None
 
+    @staticmethod
+    def _is_video_get_file_unsupported_error(exc: Exception) -> bool:
+        """识别协议端明确声明 get_file 不支持视频的错误。"""
+        message = str(exc).lower()
+        return (
+            "get_file only resolves cached image/voice ids" in message
+            or "file_id not found in the image/voice cache" in message
+        )
+
     async def _fetch_video_source_from_onebot(
         self,
         event: Optional[AstrMessageEvent],
@@ -1404,6 +1417,8 @@ class MemoryRebootPlugin(Star):
         """使用消息中的资源标识要求协议端重新下载视频。"""
         file_reference = str(video_info.get("file_reference") or "").strip()
         if not event or not file_reference:
+            return None
+        if getattr(self, "_video_get_file_supported", None) is False:
             return None
 
         bot = getattr(event, "bot", None)
@@ -1431,12 +1446,20 @@ class MemoryRebootPlugin(Star):
                 timeout=DEFAULT_VIDEO_DOWNLOAD_TIMEOUT,
             )
         except Exception as exc:
-            logger.warning(
-                f"[Memory Reboot] 通过 get_file 取回视频失败: "
-                f"{type(exc).__name__}: {exc}"
-            )
+            if self._is_video_get_file_unsupported_error(exc):
+                self._video_get_file_supported = False
+                logger.debug(
+                    "[Memory Reboot] 协议端 get_file 明确不支持视频，"
+                    "后续视频将跳过该兜底"
+                )
+            else:
+                logger.warning(
+                    f"[Memory Reboot] 通过 get_file 取回视频失败: "
+                    f"{type(exc).__name__}: {exc}"
+                )
             return None
 
+        self._video_get_file_supported = True
         data = self._onebot_response_data(result)
         if not data:
             logger.warning(
@@ -1790,10 +1813,16 @@ class MemoryRebootPlugin(Star):
                     if oversize or not file_sha256:
                         return fingerprint
                 else:
-                    logger.warning(
-                        "[Memory Reboot] 视频来源不可读，且未能通过 "
-                        "get_file 取回"
-                    )
+                    if getattr(self, "_video_get_file_supported", None) is False:
+                        logger.debug(
+                            "[Memory Reboot] 视频来源不可读；协议端 get_file "
+                            "已确认不支持视频"
+                        )
+                    else:
+                        logger.warning(
+                            "[Memory Reboot] 视频来源不可读，且未能通过 "
+                            "get_file 取回"
+                        )
                     return fingerprint
 
                 fingerprint["sha256"] = file_sha256
