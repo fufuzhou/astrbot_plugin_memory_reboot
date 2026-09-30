@@ -9,7 +9,7 @@ import time
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 
 class _Logger:
@@ -276,6 +276,8 @@ class VideoDuplicateTests(unittest.IsolatedAsyncioTestCase):
                                 "file": "content-id.mp4",
                                 "url": raw_url,
                                 "file_size": "4096",
+                                "file_id": "original-resource-id",
+                                "path": "/adapter/video.mp4",
                             },
                         }
                     ]
@@ -301,6 +303,9 @@ class VideoDuplicateTests(unittest.IsolatedAsyncioTestCase):
                 "component_file": "opaque.mp4",
                 "raw_url": raw_url,
                 "raw_file": "content-id.mp4",
+                "raw_file_id": "original-resource-id",
+                "raw_path": "/adapter/video.mp4",
+                "raw_keys": ["file", "file_id", "file_size", "path", "url"],
                 "file_reference": "content-id.mp4",
             },
         )
@@ -473,6 +478,167 @@ class VideoDuplicateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["analysis"], "unavailable")
         self.assertIsNone(result["sha256"])
         call_action.assert_awaited_once()
+
+    async def test_get_file_error_diagnostics_survive_unavailable_source(self):
+        class ActionFailed(Exception):
+            result = {
+                "status": "failed",
+                "retcode": 100,
+                "wording": "file_id not found in the image/voice cache",
+                "data": {"private": "response-secret"},
+                "echo": {"private": "echo-secret"},
+            }
+
+        self.plugin.config["video_debug_log"] = True
+        action = AsyncMock(side_effect=ActionFailed())
+        event = types.SimpleNamespace(
+            bot=types.SimpleNamespace(call_action=action),
+            message_obj=types.SimpleNamespace(self_id="bot-1", message_id="msg-1"),
+        )
+        result = await self.plugin._analyze_video(
+            {"source": "opaque.mp4", "file_reference": "resource-id"},
+            event,
+        )
+
+        self.assertEqual(result["analysis"], "unavailable")
+        retrieval = result["_debug_retrieval"]
+        self.assertEqual(retrieval["get_file"]["outcome"], "error")
+        self.assertEqual(retrieval["get_file"]["request"]["self_id"], "bot-1")
+        self.assertEqual(retrieval["get_file"]["error"]["retcode"], 100)
+        self.assertNotIn("reason", retrieval["get_file"])
+        self.assertGreaterEqual(retrieval["get_file"]["elapsed_ms"], 0)
+        self.assertEqual(retrieval["download"]["outcome"], "not_attempted")
+
+        with patch("main.logger") as test_logger:
+            self.plugin._log_video_debug(event, "group-1", [result], None, None)
+        serialized = "".join(
+            call.args[0].split(" data=", 1)[1]
+            for call in test_logger.info.call_args_list
+            if " data=" in call.args[0]
+        )
+        payload = json.loads(serialized)
+        self.assertEqual(payload["fingerprints"][0]["retrieval"], retrieval)
+        self.assertNotIn("response-secret", serialized)
+        self.assertNotIn("echo-secret", serialized)
+
+    async def test_get_file_error_does_not_stop_http_fallback_or_other_bot(self):
+        self.plugin.config["video_debug_log"] = True
+        payload = b"fallback-video"
+        video_hash = hashlib.sha256(payload).hexdigest()
+        self.plugin._download_video = AsyncMock(
+            return_value=(len(payload), video_hash, False)
+        )
+        failed_action = AsyncMock(side_effect=RuntimeError("image/voice cache miss"))
+        failed_event = types.SimpleNamespace(
+            bot=types.SimpleNamespace(call_action=failed_action),
+            message_obj=types.SimpleNamespace(self_id="bot-a"),
+        )
+        result = await self.plugin._analyze_video(
+            {
+                "source": "https://example.test/video.mp4",
+                "source_method": "raw_url",
+                "file_reference": "resource-a",
+                "size": len(payload),
+            },
+            failed_event,
+        )
+        self.assertEqual(result["sha256"], video_hash)
+        self.assertEqual(result["_debug_retrieval"]["get_file"]["outcome"], "error")
+        self.plugin._download_video.assert_awaited_once()
+
+        video_path = os.path.join(self.temp_dir.name, "bot-b.mp4")
+        Path(video_path).write_bytes(payload)
+        working_action = AsyncMock(return_value={"data": {"file": video_path}})
+        working_event = types.SimpleNamespace(
+            bot=types.SimpleNamespace(call_action=working_action),
+            message_obj=types.SimpleNamespace(self_id="bot-b"),
+        )
+        result = await self.plugin._analyze_video(
+            {"source": "opaque.mp4", "file_reference": "resource-b"},
+            working_event,
+        )
+        working_action.assert_awaited_once()
+        self.assertEqual(result["sha256"], video_hash)
+        self.assertEqual(result["_debug_retrieval"]["get_file"]["outcome"], "local_source")
+
+    async def test_http_error_records_status_and_keeps_get_file_failure(self):
+        self.plugin.config["video_debug_log"] = True
+        event = types.SimpleNamespace(
+            bot=types.SimpleNamespace(
+                call_action=AsyncMock(side_effect=RuntimeError("cache miss"))
+            ),
+            message_obj=types.SimpleNamespace(),
+        )
+        response_context = MagicMock()
+        response_context.__aenter__.return_value = types.SimpleNamespace(status=403)
+        session_context = MagicMock()
+        session_context.__aenter__.return_value = types.SimpleNamespace(
+            get=MagicMock(return_value=response_context)
+        )
+        with patch("main.aiohttp.ClientSession", return_value=session_context):
+            result = await self.plugin._analyze_video(
+                {
+                    "source": "https://example.test/expired.mp4",
+                    "file_reference": "resource-id",
+                },
+                event,
+            )
+        retrieval = result["_debug_retrieval"]
+        self.assertEqual(retrieval["get_file"]["outcome"], "error")
+        self.assertEqual(retrieval["download"]["outcome"], "error")
+        self.assertEqual(retrieval["download"]["http_status"], 403)
+        self.assertEqual(retrieval["download"]["error"]["message"], "HTTP 403")
+        self.assertIsNone(result["sha256"])
+
+    async def test_analysis_exception_preserves_retrieval_diagnostics(self):
+        self.plugin.config["video_debug_log"] = True
+        self.plugin._download_video = AsyncMock(side_effect=OSError("read failed"))
+        results = await self.plugin._analyze_videos(
+            [{"source": "https://example.test/video.mp4"}]
+        )
+        self.assertEqual(results[0]["analysis"], "unavailable")
+        self.assertEqual(
+            results[0]["_debug_retrieval"]["analysis_error"]["message"],
+            "read failed",
+        )
+
+    async def test_video_retrieval_diagnostics_are_default_off(self):
+        info = {"source": "opaque.mp4", "file_reference": "resource-id"}
+        result = await self.plugin._analyze_video(info)
+        self.assertNotIn("_debug_retrieval", info)
+        self.assertIsNone(result["_debug_retrieval"])
+
+    async def test_video_diagnostics_are_removed_before_message_is_saved(self):
+        self.plugin.config["video_debug_log"] = True
+        video = {
+            "analysis": "unavailable",
+            "_debug_retrieval": {"get_file": {"outcome": "error"}},
+            "_debug_source_url": "https://example.test/video.mp4",
+            "_debug_source_candidates": {"raw_file": "resource-id"},
+        }
+        event = types.SimpleNamespace(
+            get_group_id=lambda: "group-1",
+            get_sender_id=lambda: "user-1",
+            get_self_id=lambda: "bot-1",
+            get_sender_name=lambda: "Alice",
+            message_obj=types.SimpleNamespace(message_id="message-1"),
+        )
+        with (
+            patch.object(self.plugin, "_is_group_enabled", return_value=True),
+            patch.object(self.plugin, "_extract_content", new=AsyncMock(
+                return_value={"content": "[视频]", "has_video": True}
+            )),
+            patch.object(self.plugin, "_is_plugin_command", return_value=False),
+            patch.object(self.plugin, "_load_messages", return_value=[]),
+            patch.object(self.plugin, "_cleanup_image_cache"),
+            patch.object(self.plugin, "_analyze_videos", new=AsyncMock(return_value=[video])),
+            patch.object(self.plugin, "_append_message", new=AsyncMock()) as append,
+            patch("main.logger"),
+        ):
+            await self.plugin.on_group_message(event)
+        append.assert_awaited_once()
+        saved = append.await_args.args[1]["videos"][0]
+        self.assertFalse(any(key.startswith("_debug_") for key in saved))
 
     def test_video_embedding_excludes_synthetic_label_and_filename(self):
         content = "[视频] private-name.mp4"

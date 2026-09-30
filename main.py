@@ -1469,6 +1469,9 @@ class MemoryRebootPlugin(Star):
                         "component_file": component_file or None,
                         "raw_url": raw_url or None,
                         "raw_file": raw_file or None,
+                        "raw_file_id": str(raw_data.get("file_id") or "") or None,
+                        "raw_path": str(raw_data.get("path") or "") or None,
+                        "raw_keys": sorted(raw_data),
                         "file_reference": str(file_reference or "") or None,
                     },
                 }
@@ -1525,6 +1528,7 @@ class MemoryRebootPlugin(Star):
             routing_params["self_id"] = self_id
 
         if diagnostics is not None:
+            diagnostics.pop("reason", None)
             diagnostics.update(
                 outcome="started",
                 request={"action": "get_file", "self_id": str(self_id or "")},
@@ -1939,16 +1943,17 @@ class MemoryRebootPlugin(Star):
         if self._is_video_debug_enabled():
             local_path = self._local_video_path(str(video_info.get("source") or ""))
             local_readable = bool(local_path and os.path.isfile(local_path))
+            get_file_reason = "pending"
+            if local_readable:
+                get_file_reason = "local_source_available"
+            elif not video_info.get("file_reference"):
+                get_file_reason = "no_file_reference"
             video_info["_debug_retrieval"] = {
                 "initial_source_method": video_info.get("source_method"),
                 "initial_local_readable": local_readable,
                 "get_file": {
                     "outcome": "not_attempted",
-                    "reason": (
-                        "local_source_available"
-                        if local_readable
-                        else "no_file_reference"
-                    ),
+                    "reason": get_file_reason,
                 },
                 "download": {"outcome": "not_attempted"},
             }
