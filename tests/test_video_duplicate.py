@@ -575,7 +575,11 @@ class VideoDuplicateTests(unittest.IsolatedAsyncioTestCase):
         session_context.__aenter__.return_value = types.SimpleNamespace(
             get=MagicMock(return_value=response_context)
         )
-        with patch("main.aiohttp.ClientSession", return_value=session_context):
+        http_client = types.SimpleNamespace(
+            ClientTimeout=lambda **_kwargs: None,
+            ClientSession=MagicMock(return_value=session_context),
+        )
+        with patch("main.aiohttp", http_client):
             result = await self.plugin._analyze_video(
                 {
                     "source": "https://example.test/expired.mp4",
@@ -635,7 +639,8 @@ class VideoDuplicateTests(unittest.IsolatedAsyncioTestCase):
             patch.object(self.plugin, "_append_message", new=AsyncMock()) as append,
             patch("main.logger"),
         ):
-            await self.plugin.on_group_message(event)
+            async for _result in self.plugin.on_group_message(event):
+                pass
         append.assert_awaited_once()
         saved = append.await_args.args[1]["videos"][0]
         self.assertFalse(any(key.startswith("_debug_") for key in saved))
