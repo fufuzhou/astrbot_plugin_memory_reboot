@@ -4096,12 +4096,14 @@ class MemoryRebootPlugin(Star):
 
         embedding_content = self._embedding_content(result, content)
 
-        # 精确命中的转发无需再次生成embedding；未完整或含不可读内层
-        # 的转发也不参与语义匹配，避免隐藏内容不同却被误判。
+        # 合并转发统一只走 forward_id / forward_hash / forward_text_hash
+        # 三级精确匹配，不参与文本 Embedding。转发展示文本会把图片等
+        # 媒体统一写成“[图片]”，纯媒体转发容易被语义匹配误判为重复。
         # 视频只允许使用用户实际输入的正文，不能把合成的文件名标签
         # 送入Embedding，否则视频取回失败时极易产生假阳性。
         if (
             url_only
+            or forward_id
             or forward_matched
             or forward_truncated
             or forward_partial
