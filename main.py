@@ -1497,8 +1497,14 @@ class MemoryRebootPlugin(Star):
         video_info: Dict,
     ) -> Optional[Dict]:
         """使用消息中的资源标识要求协议端重新下载视频。"""
+        diagnostics = (video_info.get("_debug_retrieval") or {}).get("get_file")
         file_reference = str(video_info.get("file_reference") or "").strip()
         if not event or not file_reference:
+            if diagnostics is not None:
+                diagnostics.update(
+                    outcome="skipped",
+                    reason="no_event" if not event else "no_file_reference",
+                )
             return None
 
         bot = getattr(event, "bot", None)
@@ -1506,6 +1512,8 @@ class MemoryRebootPlugin(Star):
         if not callable(call_action):
             call_action = getattr(getattr(bot, "api", None), "call_action", None)
         if not callable(call_action):
+            if diagnostics is not None:
+                diagnostics.update(outcome="skipped", reason="no_call_action")
             logger.warning(
                 "[Memory Reboot] 当前消息平台不支持 get_file，无法取回视频"
             )
@@ -1516,6 +1524,13 @@ class MemoryRebootPlugin(Star):
         if self_id:
             routing_params["self_id"] = self_id
 
+        if diagnostics is not None:
+            diagnostics.update(
+                outcome="started",
+                request={"action": "get_file", "self_id": str(self_id or "")},
+                bot_type=f"{type(bot).__module__}.{type(bot).__name__}",
+            )
+        started = time.monotonic()
         try:
             result = await asyncio.wait_for(
                 call_action(
@@ -1526,14 +1541,33 @@ class MemoryRebootPlugin(Star):
                 timeout=DEFAULT_VIDEO_DOWNLOAD_TIMEOUT,
             )
         except Exception as exc:
+            if diagnostics is not None:
+                diagnostics.update(
+                    outcome="error",
+                    error=self._video_error_details(exc),
+                )
             logger.warning(
                 f"[Memory Reboot] 通过 get_file 取回视频失败: "
                 f"{type(exc).__name__}: {exc}"
             )
             return None
+        finally:
+            if diagnostics is not None:
+                diagnostics["elapsed_ms"] = round(
+                    (time.monotonic() - started) * 1000,
+                    1,
+                )
 
+        if diagnostics is not None:
+            diagnostics["response"] = {
+                key: result.get(key)
+                for key in ("status", "retcode", "wording")
+                if isinstance(result, dict) and key in result
+            }
         data = self._onebot_response_data(result)
         if not data:
+            if diagnostics is not None:
+                diagnostics["outcome"] = "empty_response"
             logger.warning(
                 "[Memory Reboot] get_file 未返回可用的视频文件信息"
             )
@@ -1557,6 +1591,8 @@ class MemoryRebootPlugin(Star):
         )
         local_path = self._local_video_path(file_source)
         if local_path and os.path.isfile(local_path):
+            if diagnostics is not None:
+                diagnostics["outcome"] = "local_source"
             return {
                 "source": file_source,
                 "source_method": "get_file_local",
@@ -1569,6 +1605,8 @@ class MemoryRebootPlugin(Star):
             if not source:
                 continue
             if source.startswith(("http://", "https://")):
+                if diagnostics is not None:
+                    diagnostics["outcome"] = "http_source"
                 return {
                     "source": source,
                     "source_method": "get_file_http",
@@ -1576,11 +1614,30 @@ class MemoryRebootPlugin(Star):
                     "name": response_name,
                 }
 
+        if diagnostics is not None:
+            diagnostics["outcome"] = "unreadable_source"
         logger.warning(
             "[Memory Reboot] get_file 已执行，但返回路径在AstrBot中不可读；"
             "请检查NapCat媒体目录的共享挂载"
         )
         return None
+
+    @staticmethod
+    def _video_error_details(exc: Exception) -> Dict:
+        """仅保留错误类型及OneBot状态，不复制响应data或echo。"""
+        details = {"type": type(exc).__name__}
+        result = getattr(exc, "result", None)
+        if isinstance(result, dict):
+            details.update(
+                {
+                    key: result[key]
+                    for key in ("status", "retcode", "wording")
+                    if key in result
+                }
+            )
+        else:
+            details["message"] = str(exc)[:1000]
+        return details
 
     @staticmethod
     def _compute_file_sha256(file_path: str) -> Optional[str]:
@@ -1650,6 +1707,7 @@ class MemoryRebootPlugin(Star):
                 else None
             ),
             "_debug_source_candidates": debug_source_candidates,
+            "_debug_retrieval": video_info.get("_debug_retrieval"),
         }
 
     @staticmethod
@@ -1687,20 +1745,28 @@ class MemoryRebootPlugin(Star):
         source: str,
         destination: str,
         size_limit: int,
+        diagnostics: Optional[Dict] = None,
     ) -> Tuple[Optional[int], Optional[str], bool]:
         """限流下载视频，返回(大小, SHA-256, 是否超限)。"""
         timeout = aiohttp.ClientTimeout(total=DEFAULT_VIDEO_DOWNLOAD_TIMEOUT)
         digest = hashlib.sha256()
         downloaded = 0
+        started = time.monotonic()
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.get(source, allow_redirects=True) as response:
+                    if diagnostics is not None:
+                        diagnostics["http_status"] = response.status
                     if response.status != 200:
                         raise RuntimeError(f"HTTP {response.status}")
                     content_length = self._parse_positive_int(
                         response.headers.get("Content-Length")
                     )
+                    if diagnostics is not None:
+                        diagnostics["content_length"] = content_length
                     if content_length and content_length > size_limit:
+                        if diagnostics is not None:
+                            diagnostics["outcome"] = "oversize"
                         return content_length, None, True
 
                     with open(destination, "wb") as file:
@@ -1709,16 +1775,32 @@ class MemoryRebootPlugin(Star):
                         ):
                             downloaded += len(chunk)
                             if downloaded > size_limit:
+                                if diagnostics is not None:
+                                    diagnostics["outcome"] = "oversize"
                                 return None, None, True
                             digest.update(chunk)
                             file.write(chunk)
+            if diagnostics is not None:
+                diagnostics["outcome"] = "downloaded"
             return downloaded, digest.hexdigest(), False
         except Exception as exc:
+            if diagnostics is not None:
+                diagnostics.update(
+                    outcome="error",
+                    error=self._video_error_details(exc),
+                )
             logger.warning(
                 f"[Memory Reboot] 视频下载失败: "
                 f"{type(exc).__name__}: {exc}"
             )
             return None, None, False
+        finally:
+            if diagnostics is not None:
+                diagnostics["downloaded_bytes"] = downloaded
+                diagnostics["elapsed_ms"] = round(
+                    (time.monotonic() - started) * 1000,
+                    1,
+                )
 
     async def _run_media_tool(
         self,
@@ -1854,7 +1936,24 @@ class MemoryRebootPlugin(Star):
         event: Optional[AstrMessageEvent] = None,
     ) -> Dict:
         """在大小限制内生成视频精确和感知指纹。"""
+        if self._is_video_debug_enabled():
+            local_path = self._local_video_path(str(video_info.get("source") or ""))
+            local_readable = bool(local_path and os.path.isfile(local_path))
+            video_info["_debug_retrieval"] = {
+                "initial_source_method": video_info.get("source_method"),
+                "initial_local_readable": local_readable,
+                "get_file": {
+                    "outcome": "not_attempted",
+                    "reason": (
+                        "local_source_available"
+                        if local_readable
+                        else "no_file_reference"
+                    ),
+                },
+                "download": {"outcome": "not_attempted"},
+            }
         resolved_info = dict(video_info)
+        diagnostics = resolved_info.get("_debug_retrieval") or {}
         declared_size = self._parse_positive_int(
             resolved_info.get("declared_size")
             or resolved_info.get("size")
@@ -1867,11 +1966,15 @@ class MemoryRebootPlugin(Star):
         )
         size_limit = self._get_video_max_size_bytes()
         if declared_size and declared_size > size_limit:
+            if diagnostics:
+                diagnostics["get_file"].update(reason="declared_oversize")
             fingerprint["analysis"] = "metadata"
             return fingerprint
 
         source = str(video_info.get("source") or "")
         if not source:
+            if diagnostics:
+                diagnostics["get_file"].update(reason="no_source")
             return fingerprint
 
         async with self._video_analysis_semaphore:
@@ -1987,6 +2090,7 @@ class MemoryRebootPlugin(Star):
                             source,
                             video_path,
                             size_limit,
+                            diagnostics=diagnostics.get("download"),
                         )
                     )
                     fingerprint = self._new_video_fingerprint(
@@ -2059,6 +2163,9 @@ class MemoryRebootPlugin(Star):
             try:
                 results.append(await self._analyze_video(video_info, event))
             except Exception as exc:
+                diagnostics = video_info.get("_debug_retrieval")
+                if diagnostics is not None:
+                    diagnostics["analysis_error"] = self._video_error_details(exc)
                 logger.error(
                     f"[Memory Reboot] 视频分析异常: "
                     f"{type(exc).__name__}: {exc}"
@@ -2110,6 +2217,7 @@ class MemoryRebootPlugin(Star):
                     "source_candidates": video.get(
                         "_debug_source_candidates"
                     ),
+                    "retrieval": video.get("_debug_retrieval"),
                 }
             )
 
@@ -4074,6 +4182,7 @@ class MemoryRebootPlugin(Star):
         for video in video_fingerprints:
             video.pop("_debug_source_url", None)
             video.pop("_debug_source_candidates", None)
+            video.pop("_debug_retrieval", None)
         usable_video_fingerprint = any(
             video.get("sha256")
             or video.get("frame_hashes")
