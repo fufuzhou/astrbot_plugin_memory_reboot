@@ -135,7 +135,15 @@ IMAGE_SEARCH_DESCRIPTION_MAX_CHARS = 160   # 搜图结果中描述的最大长�
 # 第三部分：主插件类
 # ==============================================================================
 
-class MemoryRebootPlugin(Star):
+if __package__:
+    from .memory_embedding.plugin import MultimodalMixin
+    from .memory_embedding.provider import EmbeddingError
+else:
+    from memory_embedding.plugin import MultimodalMixin
+    from memory_embedding.provider import EmbeddingError
+
+
+class MemoryRebootPlugin(MultimodalMixin, Star):
     """
     Memory Reboot - 记忆重现插件主类
     
@@ -340,6 +348,9 @@ class MemoryRebootPlugin(Star):
                 if cache_entry.get("dirty_dates", {}) == dirty_before:
                     break
         self._cache.clear()
+        manager = getattr(self, "_mm_manager", None)
+        if manager is not None:
+            await manager.close()
         logger.info("[Memory Reboot] 资源已清理")
     
     def _setup_data_directory(self):
@@ -4025,6 +4036,20 @@ class MemoryRebootPlugin(Star):
                 "video_infos": video_infos,
             }
 
+        if self._multimodal_enabled():
+            # Use actual Plain segments, never platform-generated media placeholders.
+            components = getattr(getattr(event, "message_obj", None), "message", [])
+            plain = [str(getattr(comp, "text", "")) for comp in components if isinstance(comp, Plain)]
+            raw_text = " ".join(plain).strip() if components else text
+            if image_sources:
+                return {
+                    "content": (raw_text + f" [图片×{len(image_sources)}]").strip(),
+                    "raw_text": raw_text, "image_sources": image_sources,
+                    "image_source": image_sources[0], "has_image": True,
+                    "has_video": False,
+                }
+            text = raw_text
+
         if image_sources:
             for image_source in image_sources:
                 result = await self._image_to_text(image_source)
@@ -4050,6 +4075,8 @@ class MemoryRebootPlugin(Star):
         )
         return {
             "content": text,
+            "raw_text": text,
+            "image_sources": [],
             "image_source": None,
             "has_image": False,
             "has_video": False,
@@ -4135,6 +4162,15 @@ class MemoryRebootPlugin(Star):
         # 过滤：插件命令自动过滤
         if self._is_plugin_command(content):
             logger.info(f"[Memory Reboot] 跳过: 检测到插件命令")
+            return
+
+        if self._multimodal_enabled() and not (
+            forward_id or forward_truncated or forward_partial or has_video or url_only
+        ):
+            async for response in self._on_multimodal_message(
+                event, result, group_id, sender_id, sender_name
+            ):
+                yield response
             return
 
         # 加载消息（使用内存缓存）
@@ -4517,6 +4553,10 @@ class MemoryRebootPlugin(Star):
             return
 
         messages = self._load_messages(group_id)
+        if self._multimodal_enabled():
+            async for response in self._search_multimodal(event, query, messages):
+                yield response
+            return
         matches = self._find_images_by_description(
             messages,
             query,
@@ -4577,6 +4617,23 @@ class MemoryRebootPlugin(Star):
         yield event.plain_result(
             f"⚠️ 找到了图片记录，但原消息已无法引用\n{details}"
         )
+
+    @filter.command("嵌入测试")
+    async def test_multimodal_connection(self, event: AstrMessageEvent):
+        if not event.is_admin():
+            yield event.plain_result("仅管理员可执行")
+            return
+        if not self._multimodal_enabled():
+            yield event.plain_result("当前为 legacy 模式，请先配置 LiteRT-LM 后端")
+            return
+        try:
+            capabilities = await self._embedding_manager().provider.test_connection()
+            yield event.plain_result(
+                f"文本连接成功：{capabilities['model']} / {capabilities['dimensions']}维。"
+                "图片和图文接口需用实际图片验证；不代表检索质量已校准。"
+            )
+        except EmbeddingError as exc:
+            yield event.plain_result(f"连接失败：{exc}")
 
     @filter.command("记忆状态")
     async def check_status(self, event: AstrMessageEvent):
@@ -4655,6 +4712,7 @@ class MemoryRebootPlugin(Star):
 
 📌 群号: {group_id}
 📊 消息数: {len(messages)}
+🧩 多模态: {self._multimodal_status(messages)}
 🧠 含embedding: {sum(1 for m in messages if m.get("embedding"))}
 🖼️ 含图片: {sum(1 for m in messages if m.get("has_image"))} (含哈希: {sum(1 for m in messages if m.get("image_hash"))})
 🎞️ 含视频: {sum(1 for m in messages if m.get("has_video"))} (文件SHA: {sum(1 for v in stored_videos if v.get("sha256"))} / 五帧指纹: {sum(1 for v in stored_videos if v.get("frame_hashes"))} / 元数据兜底: {sum(1 for v in stored_videos if v.get("analysis") == "metadata")})

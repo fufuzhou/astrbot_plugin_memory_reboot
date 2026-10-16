@@ -2,7 +2,9 @@
   "blocked_groups": {
     "description": "黑名单群组列表",
     "type": "list",
-    "items": {"type": "string"},
+    "items": {
+      "type": "string"
+    },
     "hint": "在此列表中的群不会启用旧闻提醒，其他群默认启用",
     "default": []
   },
@@ -72,7 +74,7 @@
     "description": "图片哈希相似度阈值",
     "type": "float",
     "hint": "图片哈希相似度阈值，用于检测相似图片（dHash 256位，建议0.90，与文本相似度是或门关系）",
-    "default": 0.90
+    "default": 0.9
   },
   "min_unique_senders": {
     "description": "最少不同用户数",
@@ -155,9 +157,25 @@
   "url_tracking_params": {
     "description": "URL规范化时移除的跟踪参数",
     "type": "list",
-    "items": {"type": "string"},
+    "items": {
+      "type": "string"
+    },
     "hint": "支持精确名称和utm_*形式的前缀规则。请只填写明确的推广跟踪参数，不要填写id、source、from等可能影响实际内容的参数。",
-    "default": ["utm_*", "fbclid", "gclid", "dclid", "msclkid", "mc_cid", "mc_eid", "igshid", "yclid", "_openstat", "spm", "spm_id_from", "vd_source"]
+    "default": [
+      "utm_*",
+      "fbclid",
+      "gclid",
+      "dclid",
+      "msclkid",
+      "mc_cid",
+      "mc_eid",
+      "igshid",
+      "yclid",
+      "_openstat",
+      "spm",
+      "spm_id_from",
+      "vd_source"
+    ]
   },
   "video_duplicate_enabled": {
     "description": "启用普通视频重复检测",
@@ -175,7 +193,7 @@
     "description": "视频五帧平均相似度阈值",
     "type": "float",
     "hint": "同一归一化时间点抽取的五帧dHash平均相似度达到此值，且至少四帧不低于0.85时，认为是同一视频。默认0.90。",
-    "default": 0.90
+    "default": 0.9
   },
   "ffmpeg_path": {
     "description": "FFmpeg可执行文件",
@@ -204,7 +222,9 @@
   "ignore_regex": {
     "description": "忽略内容的正则表达式",
     "type": "list",
-    "items": {"type": "string"},
+    "items": {
+      "type": "string"
+    },
     "hint": "匹配这些正则的消息将被直接忽略，不记录也不提醒。例如：[\"^今日运势$\", \"^签到$\", \"^/.*\"]",
     "default": []
   },
@@ -219,6 +239,153 @@
     "type": "bool",
     "hint": "启用后将自动检测并过滤其他插件的命令（如 /签到、帮助、天气 等），避免将命令误判为重复内容。需要AstrBot版本支持。",
     "default": true
+  },
+  "embedding_backend": {
+    "description": "嵌入后端",
+    "type": "string",
+    "default": "legacy",
+    "hint": "legacy 保持原行为；litert_lm 使用原生图文向量，可连接 LiteLLM。",
+    "options": [
+      "legacy",
+      "litert_lm"
+    ]
+  },
+  "embedding_api_url": {
+    "description": "Embedding API Base URL",
+    "type": "string",
+    "default": "",
+    "hint": "例如 http://10.147.17.5:4000/v1；不要填 /chat/completions。"
+  },
+  "embedding_api_key": {
+    "description": "Embedding API Key",
+    "type": "string",
+    "default": "",
+    "hint": "填写有模型权限的 LiteLLM Key；不会写入消息记录或状态日志。"
+  },
+  "embedding_model": {
+    "description": "Embedding 模型名",
+    "type": "string",
+    "default": "embeddinggemma-2-440m",
+    "hint": "填写网关中实际的模型名。"
+  },
+  "embedding_model_revision": {
+    "description": "向量空间版本",
+    "type": "string",
+    "default": "local-v1",
+    "hint": "替换模型权重或编码策略后修改此项；旧向量保留，但不混用。"
+  },
+  "embedding_dimensions": {
+    "description": "输出维度",
+    "type": "int",
+    "default": 768,
+    "hint": "0 表示不指定，首次响应确定；修改后隔离旧向量。"
+  },
+  "embedding_timeout": {
+    "description": "请求超时秒数",
+    "type": "int",
+    "default": 30,
+    "hint": "用于 embedding、图片下载和可选视觉识别。"
+  },
+  "embedding_max_concurrency": {
+    "description": "最大推理并发",
+    "type": "int",
+    "default": 2,
+    "hint": "1—8；当前本地服务串行处理，建议1或2。"
+  },
+  "embedding_max_retries": {
+    "description": "可重试错误重试次数",
+    "type": "int",
+    "default": 1,
+    "hint": "仅网络错误、429及部分5xx重试；0—3。"
+  },
+  "multimodal_fusion_enabled": {
+    "description": "补充单图图文联合向量",
+    "type": "bool",
+    "default": true,
+    "hint": "逐图向量始终保留；多图联合能力未验证，暂不请求。"
+  },
+  "multimodal_max_images": {
+    "description": "单条最多处理图片数",
+    "type": "int",
+    "default": 4,
+    "hint": "1—8；超过上限保留部分图片供搜图，但不判断整条重复。"
+  },
+  "multimodal_max_image_size_mb": {
+    "description": "单图最大大小MiB",
+    "type": "int",
+    "default": 10,
+    "hint": "限制图片读取与下载，不长期缓存图片。"
+  },
+  "multimodal_max_pixels": {
+    "description": "单图最大像素数",
+    "type": "int",
+    "default": 20000000,
+    "hint": "解码前限制，防止超大图片。"
+  },
+  "multimodal_max_side": {
+    "description": "嵌入图片最长边",
+    "type": "int",
+    "default": 1024,
+    "hint": "224—2048；影响空间标识，不影响原始图片内容哈希。"
+  },
+  "multimodal_local_image_roots": {
+    "description": "允许的本地图片目录",
+    "type": "list",
+    "default": [],
+    "hint": "默认允许系统临时目录和 data/temp；按 AstrBot 实际图片目录添加，不要设置磁盘根目录。"
+  },
+  "multimodal_allowed_image_hosts": {
+    "description": "允许的私网图片主机",
+    "type": "list",
+    "default": [],
+    "hint": "仅填确实由机器人适配器使用的主机名/IP；默认禁止私网图片下载。API地址不受此限制。"
+  },
+  "multimodal_sticker_filter_enabled": {
+    "description": "可选视觉表情包过滤",
+    "type": "bool",
+    "default": false,
+    "hint": "需要 vision_provider_id；关闭时不调用视觉模型。识别失败不当作表情包。"
+  },
+  "multimodal_vision_fallback_enabled": {
+    "description": "可选生成图片描述",
+    "type": "bool",
+    "default": false,
+    "hint": "启用后每张成功加载的图额外调用视觉模型，不是查重或搜图必需。"
+  },
+  "multimodal_text_threshold": {
+    "description": "文本重复阈值（待校准）",
+    "type": "float",
+    "default": 0.9,
+    "hint": "仅为当前模型初始值，需用真实群聊样本校准。"
+  },
+  "multimodal_image_threshold": {
+    "description": "图片重复阈值（待校准）",
+    "type": "float",
+    "default": 0.94,
+    "hint": "多图要求全部图片一一匹配，不能只命中一张。"
+  },
+  "multimodal_cross_threshold": {
+    "description": "跨模态重复阈值（待校准）",
+    "type": "float",
+    "default": 0.94,
+    "hint": "文字与单图比较的初始阈值；截图数字差异仍可能误报。"
+  },
+  "multimodal_search_threshold": {
+    "description": "搜图阈值（待校准）",
+    "type": "float",
+    "default": 0.5,
+    "hint": "搜图复用图片向量，查询使用 search query 前缀。"
+  },
+  "multimodal_top_k": {
+    "description": "语义候选Top-K",
+    "type": "int",
+    "default": 10,
+    "hint": "候选选择上限；人数仍按完整匹配规则统计，不受K截断。"
+  },
+  "semantic_auto_remind": {
+    "description": "关闭LLM后允许语义提醒",
+    "type": "bool",
+    "default": true,
+    "hint": "新模式：无需图片完全相同；关闭此项后无LLM时只提醒精确重复。"
   }
-
 }
