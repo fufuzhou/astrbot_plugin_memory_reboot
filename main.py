@@ -2947,16 +2947,27 @@ class MemoryRebootPlugin(MultimodalMixin, Star):
         current_ctx: List[Dict],
         context_stats: Dict,
         unique_count: int,
+        diagnostics: Optional[Dict] = None,
     ) -> bool:
         """LLM判断是否需要提醒"""
+        def record_judge(status, reason=None):
+            if diagnostics is not None:
+                diagnostics.clear()
+                diagnostics["status"] = status
+                if reason is not None:
+                    diagnostics["reason"] = str(reason)[:1000]
+
+        record_judge("empty_response")
         provider_id = self.config.get("judge_provider_id", "")
         if not provider_id:
+            record_judge("judge_provider_not_configured")
             logger.debug("[Memory Reboot] LLM判断: 未配置judge_provider_id，跳过判断")
             return False
         
         try:
             provider = self.context.get_provider_by_id(provider_id)
             if not provider:
+                record_judge("judge_provider_not_found")
                 logger.debug(f"[Memory Reboot] LLM判断: 未找到provider={provider_id}")
                 return False
             
@@ -3014,15 +3025,18 @@ class MemoryRebootPlugin(MultimodalMixin, Star):
                     result = json.loads(text.strip())
                     should_remind = result.get("should_remind", False)
                     reason = result.get('reason', '无')
+                    record_judge("json_response", reason)
                     logger.debug(f"[Memory Reboot] LLM返回: should_remind={should_remind}")
                     logger.debug(f"[Memory Reboot] LLM理由: {reason}")
                     return should_remind
                 except Exception as e:
                     logger.debug(f"[Memory Reboot] LLM返回JSON解析失败: {e}, 尝试文本匹配")
+                    record_judge("json_parse_failed_text_fallback")
                     matched = '"should_remind": true' in text.lower()
                     logger.debug(f"[Memory Reboot] 文本匹配结果: {matched}")
                     return matched
         except Exception as e:
+            record_judge("judge_request_failed")
             logger.error(f"[Memory Reboot] LLM判断异常: {e}")
         return False
 

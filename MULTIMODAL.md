@@ -1,4 +1,4 @@
-# EmbeddingGemma 2 多模态模式（v3.11.1）
+# EmbeddingGemma 2 多模态模式（v3.11.2）
 
 本次按讨论后的范围实现 **LiteLLM → LiteRT-LM → EmbeddingGemma 2 440M**。SiliconFlow、火山方舟留待有实际服务时接入，不提供尚未实现的配置选项。legacy 仍为默认模式。
 
@@ -145,3 +145,9 @@ candidate 记录召回分数、确认分数、文本/图片配对分数和拒绝
 gates 展示不同发送者人数、同发送者条件、历史年龄及冷却秒数；decision 展示最终是否计划提醒。该日志不证明消息已成功送达。/记忆状态 同时显示调试开关状态。
 
 日志不输出聊天正文、查询正文、图片 URL/路径/Base64、完整向量、API Key 或 LLM 原始回复。只保存到 AstrBot 日志，诊断字段在存储消息前移除。排查结束后关闭开关，避免大量输出。
+
+### LLM 判断理由（v3.11.2）
+
+开启同一个 multimodal_debug_log 开关后，llm_judge 日志新增 status 和 reason。正常 JSON 回复显示模型的 reason，最多500字符，并遮盖已配置的 Embedding Key、常见 Key/Bearer 及 URL/Base64 资源。理由可能转述聊天内容，因此仅排查时开启。不记录完整提示词或完整模型回复。
+
+status 可区分 json_response、judge_provider_not_configured、judge_provider_not_found、empty_response、json_parse_failed_text_fallback 和 judge_request_failed；非正常 JSON 时不编造模型理由。不改变原有提醒判定。

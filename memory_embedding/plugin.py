@@ -8,7 +8,7 @@ import uuid
 from astrbot.api import logger
 from astrbot.api.message_components import Plain, Reply
 
-from .diagnostics import elapsed, enabled
+from .diagnostics import elapsed, enabled, safe_reason
 from .manager import EmbeddingManager
 from .matching import candidates, compare, confirmed_candidates, search_images
 from .provider import EmbeddingError, integer
@@ -200,6 +200,7 @@ class MultimodalMixin:
                             "\n已有图片描述：" + matched["image_description"]
                         )
                     judge_start = time.perf_counter()
+                    judge_details = {} if enabled(self.config) else None
                     should_remind = await self._judge_remind(
                         judge_content,
                         sender_name,
@@ -208,15 +209,25 @@ class MultimodalMixin:
                         current,
                         stats,
                         len(senders),
+                        **(
+                            {"diagnostics": judge_details}
+                            if judge_details is not None
+                            else {}
+                        ),
                     )
                     should_remind = (
                         should_remind is True or str(should_remind).lower() == "true"
                     )
+                    if judge_details is not None and "reason" in judge_details:
+                        judge_details["reason"] = safe_reason(
+                            judge_details["reason"], self.config
+                        )
                     self._mm_debug(
                         trace,
                         "llm_judge",
                         result=should_remind,
                         elapsed_ms=elapsed(judge_start),
+                        **(judge_details or {}),
                     )
                 else:
                     should_remind = anchor["kind"] == "exact" or self.config.get(
