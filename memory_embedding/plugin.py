@@ -74,8 +74,8 @@ class MultimodalMixin:
                 "image_hash": features["images"][0]["dhash"] if len(features["images"]) == 1 else None,
                 "multimodal": features,
             }
-            messages = self._load_messages(group_id)
-            matches = candidates(messages, message, self.config)
+            messages = list(self._load_messages(group_id))
+            matches = await asyncio.to_thread(candidates, messages, message, dict(self.config))
             selected = matches[:integer(self.config, "multimodal_top_k", 10, 1, 50)]
             if not selected:
                 await self._append_message(group_id, message)
@@ -94,11 +94,14 @@ class MultimodalMixin:
                     judge_content = message["content"] + (
                         "\n[匹配依据：多模态语义/完整内容匹配。相似度不代表事实完全相同。"
                         "没有提供历史原图；不可声称看到了图片细节。仅依据可见正文和上下文判断是否适合提醒。]")
+                    if message.get("image_description"):
+                        judge_content += "\n已有当前图片描述：" + message["image_description"]
                     judge_match = dict(matched)
                     if matched.get("image_description"):
                         judge_match["content"] += "\n已有图片描述：" + matched["image_description"]
                     should_remind = await self._judge_remind(
                         judge_content, sender_name, judge_match, history, current, stats, len(senders))
+                    should_remind = should_remind is True or str(should_remind).lower() == "true"
                 else:
                     should_remind = anchor["kind"] == "exact" or self.config.get("semantic_auto_remind", True)
             await self._append_message(group_id, message)
@@ -111,7 +114,8 @@ class MultimodalMixin:
         try:
             manager = self._embedding_manager()
             vector = await manager.provider.embed_text(query, task="search")
-            matches = search_images(messages, vector, manager.provider.space, self.config)
+            matches = await asyncio.to_thread(
+                search_images, list(messages), vector, manager.provider.space, dict(self.config))
         except EmbeddingError as exc:
             logger.warning(f"[Memory Reboot] multimodal search: {exc}")
         if not matches:

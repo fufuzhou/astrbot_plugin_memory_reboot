@@ -96,9 +96,6 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
             await self.provider.embed_text("batch is not fusion")
 
     async def test_timeout_is_sanitized(self):
-        with patch.object(self.provider, "_session", side_effect=asyncio.TimeoutError):
-            # Real request timeout path is tested by a delayed local HTTP handler below.
-            pass
         async def slow(request):
             await asyncio.sleep(2)
             return web.json_response(self.body)

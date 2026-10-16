@@ -240,7 +240,8 @@
     "description": "Embedding API Key",
     "type": "string",
     "default": "",
-    "hint": "填写有模型权限的 LiteLLM Key；不会写入消息记录或状态日志。"
+    "hint": "填写有模型权限的 LiteLLM Key；不会写入消息记录或状态日志。",
+    "secret": true
   },
   "embedding_model": {
     "description": "Embedding 模型名",
@@ -369,9 +370,9 @@
     "hint": "新模式：无需图片完全相同；关闭此项后无LLM时只提醒精确重复。"
   },
   "embedding_max_text_bytes": {
-    "description": "Text input byte budget",
+    "description": "文本编码字节预算",
     "type": "int",
     "default": 900,
-    "hint": "Reject over-budget semantic encoding; keep exact fingerprints. Does not silently truncate."
+    "hint": "超过预算只保留原文及精确匹配，不静默截断；默认900字节约300个汉字，可按服务实际容量调整。"
   }
 }
