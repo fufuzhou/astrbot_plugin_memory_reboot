@@ -137,3 +137,89 @@ class DebugTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(compare(a, b, {}, detail), compare(a, b, {}))
         self.assertEqual(detail["reason"], "image_coverage_or_threshold")
         self.assertEqual(detail["image_scores"], [[1, 1], [0, 0]])
+
+
+class JudgeReasonTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reason_on_same_trace_and_switch_off_silent(self):
+        for active in (False, True):
+            case = fixtures.PluginTests()
+            await case.asyncSetUp()
+            try:
+                case.plugin.config.update(
+                    multimodal_debug_log=active,
+                    enable_llm_judge=True,
+                    judge_provider_id="judge",
+                    embedding_api_key="SECRET_API",
+                )
+                case.plugin.context = types.SimpleNamespace(
+                    get_provider_by_id=lambda _: types.SimpleNamespace(
+                        text_chat=AsyncMock(
+                            return_value=types.SimpleNamespace(
+                                completion_text=json.dumps(
+                                    {
+                                        "should_remind": False,
+                                        "reason": "normal discussion SECRET_API https://private/image",
+                                    }
+                                )
+                            )
+                        )
+                    )
+                )
+                case.seed()
+                with patch("memory_embedding.plugin.logger") as log:
+                    self.assertFalse(await case.process())
+                    if active:
+                        rows = [
+                            json.loads(c.args[0].split("] ", 2)[-1])
+                            for c in log.info.call_args_list
+                        ]
+                        row = next(r for r in rows if r["stage"] == "llm_judge")
+                        self.assertEqual(row["status"], "json_response")
+                        self.assertIn("normal discussion", row["reason"])
+                        self.assertNotIn("SECRET_API", row["reason"])
+                        self.assertNotIn("https://private", row["reason"])
+                        self.assertEqual(row["trace"], rows[-1]["trace"])
+                    else:
+                        log.info.assert_not_called()
+            finally:
+                await case.asyncTearDown()
+
+    async def test_non_model_rejection_has_explicit_status(self):
+        case = fixtures.PluginTests()
+        await case.asyncSetUp()
+        try:
+            args = ("text", "sender", fixtures.message(case.f), [], [], {}, 2)
+            details = {}
+            self.assertFalse(
+                await case.plugin._judge_remind(*args, diagnostics=details)
+            )
+            self.assertEqual(details["status"], "judge_provider_not_configured")
+            case.plugin.config["judge_provider_id"] = "judge"
+            provider = types.SimpleNamespace(text_chat=AsyncMock(return_value=None))
+            case.plugin.context = types.SimpleNamespace(
+                get_provider_by_id=lambda _: provider
+            )
+            await case.plugin._judge_remind(*args, diagnostics=details)
+            self.assertEqual(details["status"], "empty_response")
+            provider.text_chat.return_value = types.SimpleNamespace(
+                completion_text="not json"
+            )
+            await case.plugin._judge_remind(*args, diagnostics=details)
+            self.assertEqual(details["status"], "json_parse_failed_text_fallback")
+            self.assertNotIn("reason", details)
+            provider.text_chat.side_effect = RuntimeError("request failed")
+            await case.plugin._judge_remind(*args, diagnostics=details)
+            self.assertEqual(details["status"], "judge_request_failed")
+        finally:
+            await case.asyncTearDown()
+
+    async def test_reason_redacted_and_bounded(self):
+        from memory_embedding.diagnostics import safe_reason
+
+        value = safe_reason(
+            "Bearer abc sk-secret data:image/png;base64,AAAA " + "x" * 1000, {}
+        )
+        self.assertLessEqual(len(value), 500)
+        self.assertNotIn("abc", value)
+        self.assertNotIn("sk-secret", value)
+        self.assertNotIn("AAAA", value)
