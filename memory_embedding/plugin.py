@@ -8,12 +8,22 @@ import uuid
 from astrbot.api import logger
 from astrbot.api.message_components import Plain, Reply
 
+from .diagnostics import elapsed, enabled
 from .manager import EmbeddingManager
 from .matching import candidates, compare, confirmed_candidates, search_images
 from .provider import EmbeddingError, integer
 
 
 class MultimodalMixin:
+    def _mm_debug(self, trace, stage, **fields):
+        if enabled(self.config):
+            logger.info(
+                "[Memory Reboot][MultimodalDebug] "
+                + json.dumps(
+                    {"trace": trace, "stage": stage, **fields}, ensure_ascii=False
+                )
+            )
+
     def _multimodal_enabled(self):
         return self.config.get("embedding_backend", "legacy") == "litert_lm"
 
@@ -68,12 +78,36 @@ class MultimodalMixin:
             use_vision = self.config.get(
                 "multimodal_sticker_filter_enabled", False
             ) or self.config.get("multimodal_vision_fallback_enabled", False)
+            trace = uuid.uuid4().hex[:12]
+            start = time.perf_counter()
+            self._mm_debug(
+                trace,
+                "start",
+                text_chars=len(extracted.get("raw_text", "")),
+                source_images=len(extracted.get("image_sources", [])),
+            )
             features = await manager.features(
                 extracted.get("raw_text", ""),
                 extracted.get("image_sources", []),
                 self._multimodal_vision if use_vision else None,
             )
+            for detail in features.pop("_diagnostics", []):
+                self._mm_debug(trace, **detail)
+            self._mm_debug(
+                trace,
+                "features",
+                elapsed_ms=elapsed(start),
+                complete=features["complete"],
+                image_count=features["image_count"],
+                loaded_images=len(features["images"]),
+                text_vector=bool(features["text_vector"]),
+                image_vectors=sum(bool(i.get("vector")) for i in features["images"]),
+                fusion_vector=bool(features["fusion_vector"]),
+            )
             if not features["text"] and not features["image_count"]:
+                self._mm_debug(
+                    trace, "decision", remind=False, reason="empty_after_filter"
+                )
                 return
             descriptions = features.pop("descriptions", [])
             now = time.time()
@@ -94,10 +128,26 @@ class MultimodalMixin:
                 "multimodal": features,
             }
             messages = list(self._load_messages(group_id))
+            details = [] if enabled(self.config) else None
+            matching_start = time.perf_counter()
             selected = await asyncio.to_thread(
-                confirmed_candidates, messages, message, dict(self.config)
+                confirmed_candidates, messages, message, dict(self.config), details
+            )
+            if details is not None:
+                for detail in details:
+                    self._mm_debug(trace, "candidate", **detail)
+            self._mm_debug(
+                trace,
+                "matching",
+                history_records=len(messages),
+                recalled=len(details) if details is not None else None,
+                confirmed=len(selected),
+                elapsed_ms=elapsed(matching_start),
             )
             if not selected:
+                self._mm_debug(
+                    trace, "decision", remind=False, reason="no_confirmed_candidate"
+                )
                 await self._append_message(group_id, message)
                 return
             anchor = selected[0]
@@ -113,11 +163,22 @@ class MultimodalMixin:
             senders = {m.get("sender_id") for m in peers if m.get("sender_id")} | {
                 sender_id
             }
-            skip = (
-                sender_id == matched.get("sender_id")
-                or len(senders) < int(self.config.get("min_unique_senders", 3))
-                or now - matched.get("timestamp", 0)
-                < int(self.config.get("cooldown_seconds", 3600))
+            same_sender = sender_id == matched.get("sender_id")
+            min_senders = int(self.config.get("min_unique_senders", 3))
+            age = now - matched.get("timestamp", 0)
+            cooldown = int(self.config.get("cooldown_seconds", 3600))
+            skip = same_sender or len(senders) < min_senders or age < cooldown
+            self._mm_debug(
+                trace,
+                "gates",
+                same_sender=same_sender,
+                unique_senders=len(senders),
+                min_unique_senders=min_senders,
+                history_age_seconds=round(age, 2),
+                cooldown_seconds=cooldown,
+                skipped=skip,
+                anchor_kind=anchor["kind"],
+                anchor_score=anchor["score"],
             )
             should_remind = False
             if not skip:
@@ -138,6 +199,7 @@ class MultimodalMixin:
                         judge_match["content"] += (
                             "\n已有图片描述：" + matched["image_description"]
                         )
+                    judge_start = time.perf_counter()
                     should_remind = await self._judge_remind(
                         judge_content,
                         sender_name,
@@ -150,17 +212,37 @@ class MultimodalMixin:
                     should_remind = (
                         should_remind is True or str(should_remind).lower() == "true"
                     )
+                    self._mm_debug(
+                        trace,
+                        "llm_judge",
+                        result=should_remind,
+                        elapsed_ms=elapsed(judge_start),
+                    )
                 else:
                     should_remind = anchor["kind"] == "exact" or self.config.get(
                         "semantic_auto_remind", True
                     )
+            self._mm_debug(
+                trace,
+                "decision",
+                remind=bool(should_remind),
+                llm_enabled=bool(self.config.get("enable_llm_judge", True)),
+                semantic_auto_remind=bool(
+                    self.config.get("semantic_auto_remind", True)
+                ),
+                elapsed_ms=elapsed(start),
+            )
             await self._append_message(group_id, message)
             if should_remind:
                 async for result in self._send_reminder(event, matched):
                     yield result
 
     async def _search_multimodal(self, event, query, messages):
+        trace = uuid.uuid4().hex[:12]
+        start = time.perf_counter()
         matches = []
+        error = None
+        fallback = False
         try:
             manager = self._embedding_manager()
             vector = await manager.provider.embed_text(query, task="search")
@@ -172,14 +254,29 @@ class MultimodalMixin:
                 dict(self.config),
             )
         except EmbeddingError as exc:
+            error = str(exc)
             logger.warning(f"[Memory Reboot] multimodal search: {exc}")
         if not matches:
+            fallback = True
             cutoff = (
                 time.time() - int(self.config.get("data_retention_days", 7)) * 86400
             )
             matches = self._find_images_by_description(
                 [m for m in messages if m.get("timestamp", 0) >= cutoff], query
             )
+        self._mm_debug(
+            trace,
+            "search",
+            query_chars=len(query),
+            history_records=len(messages),
+            elapsed_ms=elapsed(start),
+            error=error,
+            keyword_fallback=fallback,
+            results=len(matches),
+            top_scores=[
+                m.get("_image_search_semantic_similarity") for m in matches[:10]
+            ],
+        )
         if not matches:
             yield event.plain_result(f"没找到与“{query}”相关的图片记录")
             return
@@ -221,6 +318,7 @@ class MultimodalMixin:
             return (
                 f"LiteRT-LM / {manager.provider.model} / {manager.provider.actual_dimension}维"
                 f" / 当前空间向量{count}个 / 最近错误：{manager.last_error or manager.provider.last_error or '无'}"
+                f" / 调试日志：{'开启' if enabled(self.config) else '关闭'}"
                 "\n阈值待校准；逐图向量与搜图共用；最多4图补充融合"
             )
         except EmbeddingError as exc:

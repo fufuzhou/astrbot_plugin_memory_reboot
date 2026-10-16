@@ -59,16 +59,21 @@ def image_assignment(left, right, score, minimum):
     return best
 
 
-def compare(current, stored, config):
+def compare(current, stored, config, diagnostics=None):
+    def reject(reason):
+        if diagnostics is not None:
+            diagnostics["reason"] = reason
+        return None
+
     a, b = current.get("multimodal"), stored.get("multimodal")
     if not a or not b or a.get("schema") != 1 or b.get("schema") != 1:
-        return None
+        return reject("unsupported_schema")
     if not a.get("complete") or not b.get("complete"):
-        return None
+        return reject("incomplete_content")
     at, bt = clean_text(a.get("text")), clean_text(b.get("text"))
     ai, bi = a.get("images", []), b.get("images", [])
     if numbers_conflict(at, bt):
-        return None
+        return reject("numbers_conflict")
 
     def exact_image(x, y):
         return float(
@@ -88,46 +93,58 @@ def compare(current, stored, config):
             return {"score": 1.0, "kind": "exact"}
 
     if a.get("space") != b.get("space") or not a.get("space"):
-        return None
+        return reject("different_vector_space")
     text_min = threshold(config, "multimodal_text_threshold", 0.90)
     image_min = threshold(config, "multimodal_image_threshold", 0.94)
     cross_min = threshold(config, "multimodal_cross_threshold", 0.94)
+    if diagnostics is not None:
+        diagnostics["thresholds"] = {
+            "text": text_min,
+            "image": image_min,
+            "cross": cross_min,
+        }
+        diagnostics["text_score"] = cosine(a.get("text_vector"), b.get("text_vector"))
+        diagnostics["image_scores"] = [
+            [cosine(x.get("vector"), y.get("vector")) for y in bi] for x in ai
+        ]
     scores = []
     if ai and bi:
         image_score = image_assignment(
             ai, bi, lambda x, y: cosine(x.get("vector"), y.get("vector")), image_min
         )
         if image_score is None:
-            return None
+            return reject("image_coverage_or_threshold")
         scores.append(image_score)
         # Different/additional captions must be checked, not erased by an image hit.
         if bool(at) != bool(bt):
-            return None
+            return reject("caption_presence_mismatch")
         if at and bt:
             value = cosine(a.get("text_vector"), b.get("text_vector"))
             if at != bt and value < text_min:
-                return None
+                return reject("caption_below_threshold")
             scores.append(1.0 if at == bt else value)
     elif not ai and not bi:
         if not at or not bt:
-            return None
+            return reject("missing_text")
         value = cosine(a.get("text_vector"), b.get("text_vector"))
         if value < text_min:
-            return None
+            return reject("text_below_threshold")
         scores.append(value)
     else:
         image_features, text_features = (a, b) if ai else (b, a)
         if len(image_features.get("images", [])) != 1 or not text_features.get("text"):
-            return None
+            return reject("unsupported_cross_modal_shape")
         query = text_features.get("text_vector")
         value = cosine(query, image_features["images"][0].get("vector"))
+        if diagnostics is not None:
+            diagnostics["cross_score"] = value
         if value < cross_min:
-            return None
+            return reject("cross_below_threshold")
         scores.append(value)
         if image_features.get("text"):
             caption_score = cosine(query, image_features.get("text_vector"))
             if caption_score < text_min:
-                return None
+                return reject("caption_below_threshold")
             scores.append(caption_score)
     # Fusion may strengthen ranking, but cannot bypass image coverage or caption checks.
     if a.get("fusion_vector") and b.get("fusion_vector"):
@@ -214,11 +231,22 @@ def recall_candidates(messages, current, config):
     return result[: integer(config, "multimodal_top_k", 10, 1, 50)]
 
 
-def confirmed_candidates(messages, current, config):
+def confirmed_candidates(messages, current, config, diagnostics=None):
     recalled = recall_candidates(messages, current, config)
     confirmed = []
     for item in recalled:
-        match = compare(current, item["message"], config)
+        detail = {} if diagnostics is not None else None
+        match = compare(current, item["message"], config, detail)
+        if diagnostics is not None:
+            diagnostics.append(
+                {
+                    "history_index": item["index"],
+                    "recall_score": item["score"],
+                    "accepted": match is not None,
+                    "match": match,
+                    **detail,
+                }
+            )
         if match:
             confirmed.append({**item, **match})
     return sorted(

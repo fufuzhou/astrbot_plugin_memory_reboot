@@ -28,7 +28,7 @@
 5. 在测试群发送文字、单图、多图加正文，再用 /搜图 公园新闻，使用 /记忆状态 查看当前后端、维度、空间向量数量和错误。
 6. 提醒仍须满足不同发送者人数及历史时间条件。连续发送几条消息不能绕过原有时间要求；实际 QQ 引用、图片来源需安装后验收。
 
-本地图片默认允许系统临时目录及 AstrBot 工作目录下 data/temp，其他适配器缓存目录添加到 multimodal_local_image_roots。私网图片服务（如 NapCat）须将实际主机名/IP 添加到 multimodal_allowed_image_hosts。API 地址不受此限制。图片下载不跟随重定向。
+本地图片默认允许系统临时目录及 AstrBot 工作目录下 data/temp，其他适配器缓存目录添加到 multimodal_local_image_roots。私网图片服务须将实际主机名/IP 添加到 multimodal_allowed_image_hosts。API 地址不受此限制。图片下载不跟随重定向。
 
 ## 行为与兼容
 
@@ -132,3 +132,16 @@ Remove-Item Env:EMBEDDING_API_KEY
 | tests/live_multimodal.py、live_multimodal_result.json | 真实测试及结果 |
 | tests/evaluate_multimodal.py | 标注集评测 |
 | README.md、MULTIMODAL.md | 配置、验证、升级回滚说明 |
+
+
+## 多模态调试日志
+
+在插件配置开启 multimodal_debug_log（默认 false），保存并重载插件。日志以 INFO 级别输出，在 AstrBot 日志中搜索 [MultimodalDebug]，无需切换全局 DEBUG；若全局日志过滤高于 INFO，则需要允许显示 INFO。
+
+每条处理链使用随机 trace 串联：start → image_load/text_embedding/image_embedding/fusion_embedding → features → candidate → matching → gates → llm_judge → decision。搜图使用 search，记录结果数、前10项分数、是否退回关键词搜索及接口错误。逐图 image_index 从0开始。编码耗时包括缓存命中时的调用耗时，不等于纯模型推理耗时。
+
+candidate 记录召回分数、确认分数、文本/图片配对分数和拒绝原因；只记录召回 Top-K，不输出全部历史。常见拒绝原因：numbers_conflict（正文数字冲突）、image_coverage_or_threshold（图片不能完整匹配或未达阈值）、caption_presence_mismatch（正文有无不同）、caption_below_threshold、different_vector_space。matching 的 recalled=0 表示没有进入 Top-K 的候选，可能是保留期、空间、完整性或召回阈值条件不符，不等于服务故障。
+
+gates 展示不同发送者人数、同发送者条件、历史年龄及冷却秒数；decision 展示最终是否计划提醒。该日志不证明消息已成功送达。/记忆状态 同时显示调试开关状态。
+
+日志不输出聊天正文、查询正文、图片 URL/路径/Base64、完整向量、API Key 或 LLM 原始回复。只保存到 AstrBot 日志，诊断字段在存储消息前移除。排查结束后关闭开关，避免大量输出。
