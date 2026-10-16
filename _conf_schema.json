@@ -280,10 +280,10 @@
     "hint": "仅网络错误、429及部分5xx重试；0—3。"
   },
   "multimodal_fusion_enabled": {
-    "description": "补充单图图文联合向量",
+    "description": "补充图文联合向量",
     "type": "bool",
     "default": true,
-    "hint": "逐图向量始终保留；多图联合能力未验证，暂不请求。"
+    "hint": "逐图向量始终保留；当前服务已验证最多4图融合。融合超限或失败时仍使用逐图向量。"
   },
   "multimodal_max_images": {
     "description": "单条最多处理图片数",

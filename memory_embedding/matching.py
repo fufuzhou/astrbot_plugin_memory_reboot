@@ -1,11 +1,12 @@
 """Shared-image retrieval and whole-message duplicate rules, independent of AstrBot."""
+
 import math
 import re
 import time
 
 import numpy as np
 
-from .provider import normalized, EmbeddingError
+from .provider import EmbeddingError, normalized
 
 
 def clean_text(value):
@@ -30,7 +31,10 @@ def threshold(config, key, default):
 
 
 def numbers_conflict(a, b):
-    left, right = set(re.findall(r"\d+(?:\.\d+)?", a)), set(re.findall(r"\d+(?:\.\d+)?", b))
+    left, right = (
+        set(re.findall(r"\d+(?:\.\d+)?", a)),
+        set(re.findall(r"\d+(?:\.\d+)?", b)),
+    )
     return bool(left and right and left != right)
 
 
@@ -67,13 +71,19 @@ def compare(current, stored, config):
         return None
 
     def exact_image(x, y):
-        return float(bool(
-            (x.get("sha256") and x["sha256"] == y.get("sha256"))
-            or (x.get("pixel_sha256") and x["pixel_sha256"] == y.get("pixel_sha256"))
-        ))
+        return float(
+            bool(
+                (x.get("sha256") and x["sha256"] == y.get("sha256"))
+                or (
+                    x.get("pixel_sha256") and x["pixel_sha256"] == y.get("pixel_sha256")
+                )
+            )
+        )
 
     if at == bt and (at or ai):
-        exact = (not ai and not bi) or image_assignment(ai, bi, exact_image, 1.0) is not None
+        exact = (not ai and not bi) or image_assignment(
+            ai, bi, exact_image, 1.0
+        ) is not None
         if exact:
             return {"score": 1.0, "kind": "exact"}
 
@@ -84,7 +94,9 @@ def compare(current, stored, config):
     cross_min = threshold(config, "multimodal_cross_threshold", 0.94)
     scores = []
     if ai and bi:
-        image_score = image_assignment(ai, bi, lambda x, y: cosine(x.get("vector"), y.get("vector")), image_min)
+        image_score = image_assignment(
+            ai, bi, lambda x, y: cosine(x.get("vector"), y.get("vector")), image_min
+        )
         if image_score is None:
             return None
         scores.append(image_score)
@@ -132,7 +144,9 @@ def candidates(messages, current, config):
         match = compare(current, message, config)
         if match:
             matches.append({**match, "index": index, "message": message})
-    return sorted(matches, key=lambda item: (-item["score"], item["message"].get("timestamp", 0)))
+    return sorted(
+        matches, key=lambda item: (-item["score"], item["message"].get("timestamp", 0))
+    )
 
 
 def search_images(messages, query_vector, space, config):
@@ -155,6 +169,15 @@ def search_images(messages, query_vector, space, config):
     results = []
     for score, (message, index) in zip(scores, owners):
         if score >= minimum:
-            results.append({**message, "_image_index": index, "_image_search_match_type": "multimodal",
-                            "_image_search_semantic_similarity": float(score)})
-    return sorted(results, key=lambda m: (-m["_image_search_semantic_similarity"], -m.get("timestamp", 0)))
+            results.append(
+                {
+                    **message,
+                    "_image_index": index,
+                    "_image_search_match_type": "multimodal",
+                    "_image_search_semantic_similarity": float(score),
+                }
+            )
+    return sorted(
+        results,
+        key=lambda m: (-m["_image_search_semantic_similarity"], -m.get("timestamp", 0)),
+    )

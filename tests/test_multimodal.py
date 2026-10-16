@@ -1,35 +1,50 @@
 import asyncio
 import copy
-import io
 import json
 import tempfile
 import time
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 from aiohttp import web
 from PIL import Image
 
-import test_video_duplicate  # installs isolated AstrBot API stubs
+# isort: off
+import test_video_duplicate  # noqa: F401 - installs isolated AstrBot API stubs
 from main import MemoryRebootPlugin, Plain, Image as MessageImage
-from memory_embedding.provider import LiteRTProvider, EmbeddingError, normalized
-from memory_embedding.images import ImageLoader
+from memory_embedding.provider import LiteRTProvider, EmbeddingError
 from memory_embedding.manager import EmbeddingManager
-from memory_embedding.matching import compare, candidates, search_images, image_assignment
+from memory_embedding.matching import compare, candidates, search_images
+# isort: on
 
 
 def features(text="", images=(), vector=None, space="test", complete=True):
-    return {"schema": 1, "space": space, "text": text, "text_vector": vector,
-            "images": [{"sha256": str(i), "vector": v, "dhash": "0" * 64} for i, v in images],
-            "image_count": len(images), "complete": complete, "fusion_vector": None}
+    return {
+        "schema": 1,
+        "space": space,
+        "text": text,
+        "text_vector": vector,
+        "images": [
+            {"sha256": str(i), "vector": v, "dhash": "0" * 64} for i, v in images
+        ],
+        "image_count": len(images),
+        "complete": complete,
+        "fusion_vector": None,
+    }
 
 
 def message(f, sender="a", timestamp=None):
-    return {"multimodal": f, "sender_id": sender, "sender_name": sender,
-            "content": f["text"] or "[images]", "has_image": bool(f["images"]),
-            "message_id": sender, "timestamp": timestamp or time.time() - 7200}
+    return {
+        "multimodal": f,
+        "sender_id": sender,
+        "sender_name": sender,
+        "content": f["text"] or "[images]",
+        "has_image": bool(f["images"]),
+        "message_id": sender,
+        "timestamp": timestamp or time.time() - 7200,
+    }
 
 
 class ProviderTests(unittest.IsolatedAsyncioTestCase):
@@ -42,6 +57,7 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
             self.requests.append(await request.json())
             status = self.statuses.pop(0) if self.statuses else 200
             return web.json_response(self.body, status=status)
+
         app = web.Application()
         app.router.add_post("/v1/embeddings", endpoint)
         self.runner = web.AppRunner(app)
@@ -49,8 +65,11 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
         site = web.TCPSite(self.runner, "127.0.0.1", 0)
         await site.start()
         port = site._server.sockets[0].getsockname()[1]
-        self.config = {"embedding_api_url": f"http://127.0.0.1:{port}/v1",
-                       "embedding_dimensions": 2, "embedding_max_retries": 1}
+        self.config = {
+            "embedding_api_url": f"http://127.0.0.1:{port}/v1",
+            "embedding_dimensions": 2,
+            "embedding_max_retries": 1,
+        }
         self.provider = LiteRTProvider(self.config)
 
     async def asyncTearDown(self):
@@ -61,9 +80,13 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.provider.embed_text(" hello "), [0.6, 0.8])
         await self.provider.embed_image("data:image/png;base64,AAAA")
         await self.provider.embed_multimodal("caption", ["data:image/png;base64,AAAA"])
-        self.assertEqual(self.requests[0]["input"], "task: sentence similarity | text: hello")
+        self.assertEqual(
+            self.requests[0]["input"], "task: sentence similarity | text: hello"
+        )
         self.assertEqual(self.requests[1]["input"][0]["type"], "image_url")
-        self.assertEqual([v["type"] for v in self.requests[2]["input"]], ["text", "image_url"])
+        self.assertEqual(
+            [v["type"] for v in self.requests[2]["input"]], ["text", "image_url"]
+        )
         self.assertEqual(self.requests[2]["dimensions"], 2)
 
     async def test_query_role_cache_and_space(self):
@@ -99,6 +122,7 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
         async def slow(request):
             await asyncio.sleep(2)
             return web.json_response(self.body)
+
         app = web.Application()
         app.router.add_post("/v1/embeddings", slow)
         runner = web.AppRunner(app)
@@ -106,8 +130,14 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
         site = web.TCPSite(runner, "127.0.0.1", 0)
         await site.start()
         port = site._server.sockets[0].getsockname()[1]
-        provider = LiteRTProvider({**self.config, "embedding_api_url": f"http://127.0.0.1:{port}/v1",
-                                  "embedding_timeout": 1, "embedding_max_retries": 0})
+        provider = LiteRTProvider(
+            {
+                **self.config,
+                "embedding_api_url": f"http://127.0.0.1:{port}/v1",
+                "embedding_timeout": 1,
+                "embedding_max_retries": 0,
+            }
+        )
         try:
             with self.assertRaisesRegex(EmbeddingError, "^embedding_network_error$"):
                 await provider.embed_text("private input")
@@ -116,8 +146,8 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
             await runner.cleanup()
 
     async def test_unsupported_multi_image_and_long_text(self):
-        with self.assertRaisesRegex(EmbeddingError, "unverified"):
-            await self.provider.embed_multimodal("", ["a", "b"])
+        with self.assertRaisesRegex(EmbeddingError, "fusion_image_limit"):
+            await self.provider.embed_multimodal("", ["a"] * 5)
         with self.assertRaisesRegex(EmbeddingError, "budget"):
             await self.provider.embed_text("x" * 901)
         self.assertFalse(self.requests)
@@ -126,7 +156,7 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
 class MatchingTests(unittest.TestCase):
     def test_recompressed_image_can_match_semantically(self):
         a = message(features(images=[("original", [1, 0])]))
-        b = message(features(images=[("recompressed", [.999, .01])]))
+        b = message(features(images=[("recompressed", [0.999, 0.01])]))
         self.assertEqual(compare(a, b, {})["kind"], "semantic")
 
     def test_dhash_collision_does_not_confirm(self):
@@ -176,7 +206,9 @@ class MatchingTests(unittest.TestCase):
         self.assertFalse(search_images([image], [1, 0], "other", {}))
 
     def test_expired_records_not_recalled(self):
-        old = message(features("same", vector=[1, 0]), timestamp=time.time()-9*86400)
+        old = message(
+            features("same", vector=[1, 0]), timestamp=time.time() - 9 * 86400
+        )
         now = message(features("same", vector=[1, 0]))
         self.assertFalse(candidates([old], now, {}))
 
@@ -192,8 +224,9 @@ class ImageAndManagerTests(unittest.IsolatedAsyncioTestCase):
         self.root = Path(self.temp.name)
         self.image = self.root / "image.png"
         Image.new("RGB", (32, 32), "red").save(self.image)
-        self.manager = EmbeddingManager({"embedding_api_url": "http://127.0.0.1:1/v1",
-                                         "embedding_dimensions": 2})
+        self.manager = EmbeddingManager(
+            {"embedding_api_url": "http://127.0.0.1:1/v1", "embedding_dimensions": 2}
+        )
         self.manager.provider.embed_text = AsyncMock(return_value=[1, 0])
         self.manager.provider.embed_image = AsyncMock(return_value=[1, 0])
         self.manager.provider.embed_multimodal = AsyncMock(return_value=[1, 0])
@@ -204,15 +237,19 @@ class ImageAndManagerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_multi_image_no_vision_no_persistent_copy(self):
         before = list(self.root.iterdir())
-        result = await self.manager.features("caption", [str(self.image), str(self.image)])
+        result = await self.manager.features(
+            "caption", [str(self.image), str(self.image)]
+        )
         self.assertEqual(len(result["images"]), 2)
         self.assertTrue(result["complete"])
-        self.manager.provider.embed_multimodal.assert_not_awaited()
+        self.manager.provider.embed_multimodal.assert_awaited_once()
         self.assertNotIn("data_uri", json.dumps(result))
         self.assertEqual(before, list(self.root.iterdir()))
 
     async def test_failed_image_preserves_partial_search_features(self):
-        result = await self.manager.features("", [str(self.image), str(self.root/"missing")])
+        result = await self.manager.features(
+            "", [str(self.image), str(self.root / "missing")]
+        )
         self.assertFalse(result["complete"])
         self.assertEqual(result["image_count"], 2)
         self.assertEqual(len(result["images"]), 1)
@@ -231,17 +268,25 @@ class ImageAndManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result["images"][0]["vector"])
 
     async def test_ssrf_and_untrusted_paths_rejected(self):
-        for source in ["http://127.0.0.1/image", "http://169.254.169.254/metadata",
-                       "file://remote/share/image", "https://user:pass@example.com/x"]:
+        for source in [
+            "http://127.0.0.1/image",
+            "http://169.254.169.254/metadata",
+            "file://remote/share/image",
+            "https://user:pass@example.com/x",
+        ]:
             with self.subTest(source=source), self.assertRaises(EmbeddingError):
                 await self.manager.images.load(source)
         with self.assertRaises(EmbeddingError):
             await self.manager.images.load(str(Path(__file__).resolve()))
 
     async def test_optional_sticker_unknown_not_dropped(self):
-        result = await self.manager.features("", [str(self.image)], AsyncMock(return_value=None))
+        result = await self.manager.features(
+            "", [str(self.image)], AsyncMock(return_value=None)
+        )
         self.assertEqual(len(result["images"]), 1)
-        result = await self.manager.features("", [str(self.image)], AsyncMock(return_value=False))
+        result = await self.manager.features(
+            "", [str(self.image)], AsyncMock(return_value=False)
+        )
         self.assertEqual(result["image_count"], 0)
 
     async def test_image_pixel_limit_and_recompression_hash(self):
@@ -261,29 +306,48 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.plugin = object.__new__(MemoryRebootPlugin)
-        self.plugin.config = {"embedding_backend": "litert_lm", "enable_llm_judge": False}
+        self.plugin.config = {
+            "embedding_backend": "litert_lm",
+            "enable_llm_judge": False,
+        }
         self.plugin.data_dir = self.temp.name
         self.plugin.plugin_dir = self.temp.name
         self.plugin._cache = {}
         self.f = features("a shared news item", vector=[1, 0])
         self.plugin._mm_manager = types.SimpleNamespace(
-            features=AsyncMock(side_effect=lambda *a: copy.deepcopy(self.f)), close=AsyncMock())
+            features=AsyncMock(side_effect=lambda *a: copy.deepcopy(self.f)),
+            close=AsyncMock(),
+        )
         self.event = types.SimpleNamespace(
             message_obj=types.SimpleNamespace(message_id="new"),
-            chain_result=lambda x:x, plain_result=lambda x:x)
+            chain_result=lambda x: x,
+            plain_result=lambda x: x,
+        )
 
     async def asyncTearDown(self):
         await self.plugin.terminate()
         self.temp.cleanup()
 
     async def process(self, sender="c", group="g"):
-        return [r async for r in self.plugin._on_multimodal_message(
-            self.event, {"content": "a shared news item", "raw_text": "a shared news item"}, group, sender, sender)]
+        return [
+            r
+            async for r in self.plugin._on_multimodal_message(
+                self.event,
+                {"content": "a shared news item", "raw_text": "a shared news item"},
+                group,
+                sender,
+                sender,
+            )
+        ]
 
     def seed(self, senders=("a", "b"), age=7200):
         self.plugin._cache["g"] = {
-            "messages": [message(copy.deepcopy(self.f), s, time.time()-age) for s in senders],
-            "last_load": time.time(), "dirty_dates": {}}
+            "messages": [
+                message(copy.deepcopy(self.f), s, time.time() - age) for s in senders
+            ],
+            "last_load": time.time(),
+            "dirty_dates": {},
+        }
 
     async def test_three_senders_remind_and_group_isolation(self):
         self.seed()
@@ -302,21 +366,30 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await self.process())
 
     async def test_new_fields_round_trip_without_overwriting_old_embedding(self):
-        legacy = {"timestamp":time.time(), "embedding":[4,5], "content":"old", "sender_id":"old"}
+        legacy = {
+            "timestamp": time.time(),
+            "embedding": [4, 5],
+            "content": "old",
+            "sender_id": "old",
+        }
         await self.plugin._append_message("g", legacy)
         await self.process()
         await self.plugin._flush_cache("g")
         self.plugin._cache.clear()
         loaded = self.plugin._load_messages("g")
-        self.assertEqual(loaded[0]["embedding"], [4,5])
+        self.assertEqual(loaded[0]["embedding"], [4, 5])
         self.assertIn("multimodal", loaded[1])
         self.assertIsNone(loaded[1]["embedding"])
 
     async def test_extraction_keeps_all_images_without_vision(self):
         self.event.message_str = "caption [image]"
-        self.event.message_obj.message = [Plain("caption"), MessageImage(path="one"), MessageImage(path="two")]
+        self.event.message_obj.message = [
+            Plain("caption"),
+            MessageImage(path="one"),
+            MessageImage(path="two"),
+        ]
         self.plugin._image_to_text = AsyncMock()
         result = await self.plugin._extract_content(self.event, "g")
-        self.assertEqual(result["image_sources"], ["one","two"])
+        self.assertEqual(result["image_sources"], ["one", "two"])
         self.assertEqual(result["raw_text"], "caption")
         self.plugin._image_to_text.assert_not_awaited()

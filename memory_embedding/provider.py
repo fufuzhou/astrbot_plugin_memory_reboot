@@ -1,4 +1,5 @@
 """LiteRT-LM wire adapter. No model inference runs inside AstrBot."""
+
 import asyncio
 import hashlib
 import json
@@ -41,12 +42,19 @@ class LiteRTProvider:
         self.config = dict(config)
         self.url = str(config.get("embedding_api_url", "")).strip().rstrip("/")
         if self.url.endswith("/embeddings"):
-            self.url = self.url[:-len("/embeddings")]
+            self.url = self.url[: -len("/embeddings")]
         try:
             parsed = urlsplit(self.url)
         except ValueError:
             parsed = urlsplit("")
-        if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        if (
+            parsed.scheme not in ("http", "https")
+            or not parsed.hostname
+            or parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+        ):
             self.url_error = "invalid_api_url"
         else:
             self.url_error = ""
@@ -55,12 +63,15 @@ class LiteRTProvider:
         self.actual_dimension = self.dimension
         self.timeout = integer(config, "embedding_timeout", 30, 1, 180)
         self.retries = integer(config, "embedding_max_retries", 1, 0, 3)
-        self.semaphore = asyncio.Semaphore(integer(config, "embedding_max_concurrency", 2, 1, 8))
+        self.semaphore = asyncio.Semaphore(
+            integer(config, "embedding_max_concurrency", 2, 1, 8)
+        )
         self.session = None
         self.cache = OrderedDict()
         self.last_error = ""
         self.signature = {
-            "schema": 1, "model": self.model,
+            "schema": 1,
+            "model": self.model,
             "revision": str(config.get("embedding_model_revision", "local-v1")),
             "endpoint": self.url if not self.url_error else "invalid",
             "strategy": "eg2-shared-images-v1",
@@ -83,10 +94,15 @@ class LiteRTProvider:
 
     def get_capabilities(self):
         return {
-            "provider": "litert_lm", "model": self.model,
-            "text": True, "image": True, "text_image_fusion": True,
-            "multi_image_fusion": "unverified",
-            "dimensions": self.actual_dimension, "space": self.space,
+            "provider": "litert_lm",
+            "model": self.model,
+            "text": True,
+            "image": True,
+            "text_image_fusion": True,
+            "multi_image_fusion": True,
+            "max_fusion_images": 4,
+            "dimensions": self.actual_dimension,
+            "space": self.space,
             "max_images": integer(self.config, "multimodal_max_images", 4, 1, 8),
             "service_max_input_tokens": 1024,
         }
@@ -98,7 +114,9 @@ class LiteRTProvider:
         payload = {"model": self.model, "input": content, "encoding_format": "float"}
         if self.dimension:
             payload["dimensions"] = self.dimension
-        cache_key = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+        cache_key = hashlib.sha256(
+            json.dumps(payload, sort_keys=True).encode()
+        ).hexdigest()
         async with self.semaphore:
             cached = self.cache.get(cache_key)
             if cached and time.monotonic() - cached[0] < 600:
@@ -109,11 +127,21 @@ class LiteRTProvider:
             headers = {"Authorization": "Bearer " + key} if key else {}
             for attempt in range(self.retries + 1):
                 try:
-                    async with session.post(self.url + "/embeddings", json=payload, headers=headers, allow_redirects=False) as response:
+                    async with session.post(
+                        self.url + "/embeddings",
+                        json=payload,
+                        headers=headers,
+                        allow_redirects=False,
+                    ) as response:
                         if response.status != 200:
-                            error = EmbeddingError("embedding_http_" + str(response.status))
-                            if response.status in (429, 500, 502, 503, 504) and attempt < self.retries:
-                                await asyncio.sleep(0.5 * 2 ** attempt)
+                            error = EmbeddingError(
+                                "embedding_http_" + str(response.status)
+                            )
+                            if (
+                                response.status in (429, 500, 502, 503, 504)
+                                and attempt < self.retries
+                            ):
+                                await asyncio.sleep(0.5 * 2**attempt)
                                 continue
                             raise error
                         raw = bytearray()
@@ -123,7 +151,11 @@ class LiteRTProvider:
                                 raise EmbeddingError("embedding_response_too_large")
                         body = json.loads(raw)
                     rows = body.get("data")
-                    if not isinstance(rows, list) or len(rows) != 1 or rows[0].get("index", 0) != 0:
+                    if (
+                        not isinstance(rows, list)
+                        or len(rows) != 1
+                        or rows[0].get("index", 0) != 0
+                    ):
                         raise EmbeddingError("expected_one_joint_vector")
                     vector = normalized(rows[0].get("embedding"), self.actual_dimension)
                     self.actual_dimension = len(vector)
@@ -134,32 +166,57 @@ class LiteRTProvider:
                     return list(vector)
                 except (aiohttp.ClientError, asyncio.TimeoutError):
                     if attempt < self.retries:
-                        await asyncio.sleep(0.5 * 2 ** attempt)
+                        await asyncio.sleep(0.5 * 2**attempt)
                         continue
                     self.last_error = "embedding_network_error"
                     raise EmbeddingError(self.last_error) from None
-                except (ValueError, TypeError, AttributeError, KeyError, EmbeddingError) as exc:
-                    self.last_error = str(exc) if isinstance(exc, EmbeddingError) else "invalid_embedding_response"
+                except (
+                    ValueError,
+                    TypeError,
+                    AttributeError,
+                    KeyError,
+                    EmbeddingError,
+                ) as exc:
+                    self.last_error = (
+                        str(exc)
+                        if isinstance(exc, EmbeddingError)
+                        else "invalid_embedding_response"
+                    )
                     raise EmbeddingError(self.last_error) from None
 
     async def embed_text(self, text, task="similarity"):
-        if len(text.encode("utf-8")) > integer(self.config, "embedding_max_text_bytes", 900, 64, 20000):
+        if len(text.encode("utf-8")) > integer(
+            self.config, "embedding_max_text_bytes", 900, 64, 20000
+        ):
             raise EmbeddingError("text_budget_exceeded")
-        prefix = "task: search query | text: " if task == "search" else "task: sentence similarity | text: "
+        prefix = (
+            "task: search query | text: "
+            if task == "search"
+            else "task: sentence similarity | text: "
+        )
         return await self._request(prefix + text.strip())
 
     async def embed_image(self, image):
         return await self._request([{"type": "image_url", "image_url": {"url": image}}])
 
     async def embed_multimodal(self, text, images):
-        if len(text.encode("utf-8")) > integer(self.config, "embedding_max_text_bytes", 900, 64, 20000):
+        if len(text.encode("utf-8")) > integer(
+            self.config, "embedding_max_text_bytes", 900, 64, 20000
+        ):
             raise EmbeddingError("text_budget_exceeded")
-        if len(images) != 1:
-            raise EmbeddingError("multi_image_fusion_unverified")
+        if not 1 <= len(images) <= 4:
+            raise EmbeddingError("fusion_image_limit")
         parts = []
         if text.strip():
-            parts.append({"type": "text", "text": "task: sentence similarity | text: " + text.strip()})
-        parts.extend({"type": "image_url", "image_url": {"url": image}} for image in images)
+            parts.append(
+                {
+                    "type": "text",
+                    "text": "task: sentence similarity | text: " + text.strip(),
+                }
+            )
+        parts.extend(
+            {"type": "image_url", "image_url": {"url": image}} for image in images
+        )
         return await self._request(parts)
 
     async def test_connection(self):
