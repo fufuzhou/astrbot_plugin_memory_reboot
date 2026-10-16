@@ -2,9 +2,7 @@
   "blocked_groups": {
     "description": "黑名单群组列表",
     "type": "list",
-    "items": {
-      "type": "string"
-    },
+    "items": {"type": "string"},
     "hint": "在此列表中的群不会启用旧闻提醒，其他群默认启用",
     "default": []
   },
@@ -74,7 +72,7 @@
     "description": "图片哈希相似度阈值",
     "type": "float",
     "hint": "图片哈希相似度阈值，用于检测相似图片（dHash 256位，建议0.90，与文本相似度是或门关系）",
-    "default": 0.9
+    "default": 0.90
   },
   "min_unique_senders": {
     "description": "最少不同用户数",
@@ -157,25 +155,9 @@
   "url_tracking_params": {
     "description": "URL规范化时移除的跟踪参数",
     "type": "list",
-    "items": {
-      "type": "string"
-    },
+    "items": {"type": "string"},
     "hint": "支持精确名称和utm_*形式的前缀规则。请只填写明确的推广跟踪参数，不要填写id、source、from等可能影响实际内容的参数。",
-    "default": [
-      "utm_*",
-      "fbclid",
-      "gclid",
-      "dclid",
-      "msclkid",
-      "mc_cid",
-      "mc_eid",
-      "igshid",
-      "yclid",
-      "_openstat",
-      "spm",
-      "spm_id_from",
-      "vd_source"
-    ]
+    "default": ["utm_*", "fbclid", "gclid", "dclid", "msclkid", "mc_cid", "mc_eid", "igshid", "yclid", "_openstat", "spm", "spm_id_from", "vd_source"]
   },
   "video_duplicate_enabled": {
     "description": "启用普通视频重复检测",
@@ -193,7 +175,7 @@
     "description": "视频五帧平均相似度阈值",
     "type": "float",
     "hint": "同一归一化时间点抽取的五帧dHash平均相似度达到此值，且至少四帧不低于0.85时，认为是同一视频。默认0.90。",
-    "default": 0.9
+    "default": 0.90
   },
   "ffmpeg_path": {
     "description": "FFmpeg可执行文件",
@@ -222,9 +204,7 @@
   "ignore_regex": {
     "description": "忽略内容的正则表达式",
     "type": "list",
-    "items": {
-      "type": "string"
-    },
+    "items": {"type": "string"},
     "hint": "匹配这些正则的消息将被直接忽略，不记录也不提醒。例如：[\"^今日运势$\", \"^签到$\", \"^/.*\"]",
     "default": []
   },
@@ -388,5 +368,10 @@
     "default": true,
     "hint": "新模式：无需图片完全相同；关闭此项后无LLM时只提醒精确重复。"
   },
-
+  "embedding_max_text_bytes": {
+    "description": "Text input byte budget",
+    "type": "int",
+    "default": 900,
+    "hint": "Reject over-budget semantic encoding; keep exact fingerprints. Does not silently truncate."
+  }
 }
