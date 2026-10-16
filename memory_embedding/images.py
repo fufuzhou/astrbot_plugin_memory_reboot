@@ -7,6 +7,7 @@ import io
 import ipaddress
 import socket
 import tempfile
+import time
 import warnings
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
@@ -165,6 +166,59 @@ class ImageLoader:
                 raise
             except Exception:
                 raise EmbeddingError("image_load_failed") from None
+
+    async def load_candidates(self, sources, attempts=None):
+        """Try alternative locations for ONE image, with a shared time budget."""
+        if isinstance(sources, str):
+            return await self.load(sources)
+        candidates = list(
+            dict.fromkeys(s for s in sources[:6] if isinstance(s, str) and s.strip())
+        )
+
+        async def attempt_sources():
+            last_error = EmbeddingError("missing_image_source")
+            for index, source in enumerate(candidates):
+                start = time.perf_counter()
+                kind = "local"
+                if source.startswith(("http://", "https://")):
+                    kind = "http"
+                elif source.startswith(("data:", "base64://")):
+                    kind = "inline"
+                try:
+                    result = await self.load(source)
+                except EmbeddingError as exc:
+                    last_error = exc
+                    if attempts is not None:
+                        attempts.append(
+                            {
+                                "candidate_index": index,
+                                "source_type": kind,
+                                "ok": False,
+                                "error": str(exc),
+                                "elapsed_ms": round(
+                                    (time.perf_counter() - start) * 1000, 2
+                                ),
+                            }
+                        )
+                else:
+                    if attempts is not None:
+                        attempts.append(
+                            {
+                                "candidate_index": index,
+                                "source_type": kind,
+                                "ok": True,
+                                "elapsed_ms": round(
+                                    (time.perf_counter() - start) * 1000, 2
+                                ),
+                            }
+                        )
+                    return result
+            raise last_error
+
+        try:
+            return await asyncio.wait_for(attempt_sources(), timeout=self.timeout)
+        except asyncio.TimeoutError:
+            raise EmbeddingError("image_sources_timeout") from None
 
     async def close(self):
         if self.session is not None:

@@ -4101,6 +4101,7 @@ class MemoryRebootPlugin(MultimodalMixin, Star):
             }
 
         if self._multimodal_enabled():
+            image_sources = self._multimodal_image_sources(event)
             # Use actual Plain segments, never platform-generated media placeholders.
             components = getattr(getattr(event, "message_obj", None), "message", [])
             plain = [str(getattr(comp, "text", "")) for comp in components if isinstance(comp, Plain)]

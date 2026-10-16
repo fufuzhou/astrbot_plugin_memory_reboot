@@ -72,8 +72,11 @@ class EmbeddingManager:
             excluded = 0
             for source_index, source in enumerate(sources[:limit]):
                 start = time.perf_counter()
+                attempts = (
+                    [] if diagnostics is not None and isinstance(source, list) else None
+                )
                 try:
-                    image = await self.images.load(source)
+                    image = await self.images.load_candidates(source, attempts)
                 except EmbeddingError as exc:
                     self.last_error = str(exc)
                     result["complete"] = False
@@ -88,6 +91,16 @@ class EmbeddingManager:
                             }
                         )
                     continue
+                finally:
+                    if attempts:
+                        diagnostics.extend(
+                            {
+                                "stage": "image_source_attempt",
+                                "image_index": source_index,
+                                **item,
+                            }
+                            for item in attempts
+                        )
                 if diagnostics is not None:
                     diagnostics.append(
                         {

@@ -6,7 +6,7 @@ import time
 import uuid
 
 from astrbot.api import logger
-from astrbot.api.message_components import Plain, Reply
+from astrbot.api.message_components import Image, Plain, Reply
 
 from .diagnostics import elapsed, enabled, safe_reason
 from .judge import exact_repeat, match_evidence
@@ -24,6 +24,42 @@ class MultimodalMixin:
                     {"trace": trace, "stage": stage, **fields}, ensure_ascii=False
                 )
             )
+
+    def _multimodal_image_sources(self, event):
+        message = getattr(event, "message_obj", None)
+        images = [c for c in getattr(message, "message", []) if isinstance(c, Image)]
+        raw = getattr(message, "raw_message", None)
+        segments = raw.get("message", []) if isinstance(raw, dict) else []
+        raw_images = (
+            [
+                s.get("data", {})
+                for s in segments
+                if isinstance(s, dict)
+                and s.get("type") == "image"
+                and isinstance(s.get("data"), dict)
+            ]
+            if isinstance(segments, list)
+            else []
+        )
+        aligned = len(images) == len(raw_images)
+        result = []
+        for index, component in enumerate(images):
+            candidates = [
+                getattr(component, key, None) for key in ("path", "url", "file")
+            ]
+            if aligned:
+                candidates += [
+                    raw_images[index].get(key) for key in ("path", "url", "file")
+                ]
+            candidates = list(
+                dict.fromkeys(
+                    str(s).strip()
+                    for s in candidates
+                    if isinstance(s, str) and s.strip()
+                )
+            )
+            result.append(candidates[0] if len(candidates) == 1 else candidates)
+        return result
 
     def _multimodal_enabled(self):
         return self.config.get("embedding_backend", "legacy") == "litert_lm"
