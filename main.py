@@ -2733,6 +2733,7 @@ class MemoryRebootPlugin(MultimodalMixin, Star):
         self,
         messages: List[Dict],
         matched_idx: int,
+        exact_matcher=None,
     ) -> Tuple[List[Dict], List[Dict], Dict]:
         """构造有界上下文，并预计算模型判断复读所需的客观统计。"""
         if not messages:
@@ -2778,12 +2779,15 @@ class MemoryRebootPlugin(MultimodalMixin, Star):
             current_message.get("content")
         )
         messages_in_window = recent_messages + [current_message]
-        exact_messages = [
-            message
+        exact_flags = [
+            bool(exact_matcher(current_message, message))
+            if exact_matcher is not None
+            else bool(target_text) and self._normalize_judge_text(message.get("content")) == target_text
             for message in messages_in_window
-            if target_text
-            and self._normalize_judge_text(message.get("content"))
-            == target_text
+        ]
+        exact_messages = [
+            message for message, is_exact in zip(messages_in_window, exact_flags)
+            if is_exact
         ]
         exact_senders = {
             str(message.get("sender_id"))
@@ -2798,12 +2802,7 @@ class MemoryRebootPlugin(MultimodalMixin, Star):
 
         longest_run = 0
         current_run = 0
-        for message in messages_in_window:
-            is_exact = (
-                bool(target_text)
-                and self._normalize_judge_text(message.get("content"))
-                == target_text
-            )
+        for is_exact in exact_flags:
             if is_exact:
                 current_run += 1
                 longest_run = max(longest_run, current_run)
@@ -2830,6 +2829,8 @@ class MemoryRebootPlugin(MultimodalMixin, Star):
             "history_context_messages": len(history_context),
             "current_context_messages": len(current_context),
         }
+        if exact_matcher is not None:
+            stats["repeat_basis"] = "multimodal_exact"
         return history_context, current_context, stats
 
     def _format_judge_context_stats(self, stats: Dict) -> str:
@@ -2843,12 +2844,15 @@ class MemoryRebootPlugin(MultimodalMixin, Star):
             )
         else:
             exact_time_range = "无"
+        repeat_label = "待判断文本精确出现"
+        if stats.get("repeat_basis") == "multimodal_exact":
+            repeat_label = "完整消息精确重复（正文及图片指纹，不按图片占位符或语义近似计数）"
         return "\n".join(
             [
                 f"- 统计窗口：最近{stats.get('window_seconds', 0)}秒",
                 f"- 窗口内消息：{stats.get('messages_in_window', 0)}条",
                 (
-                    "- 待判断文本精确出现："
+                    f"- {repeat_label}："
                     f"{stats.get('exact_repeat_count', 0)}次，"
                     f"涉及{stats.get('exact_unique_senders', 0)}名发送者"
                 ),
@@ -2948,6 +2952,7 @@ class MemoryRebootPlugin(MultimodalMixin, Star):
         context_stats: Dict,
         unique_count: int,
         diagnostics: Optional[Dict] = None,
+        match_evidence: Optional[str] = None,
     ) -> bool:
         """LLM判断是否需要提醒"""
         def record_judge(status, reason=None):
@@ -3015,6 +3020,8 @@ class MemoryRebootPlugin(MultimodalMixin, Star):
                     context_stats=context_stats_str,
                 )
 
+            if match_evidence:
+                prompt += "\n\n" + match_evidence
             response = await provider.text_chat(prompt=prompt, contexts=[])
 
             if response and response.completion_text:

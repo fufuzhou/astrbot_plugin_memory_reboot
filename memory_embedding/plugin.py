@@ -9,6 +9,7 @@ from astrbot.api import logger
 from astrbot.api.message_components import Plain, Reply
 
 from .diagnostics import elapsed, enabled, safe_reason
+from .judge import exact_repeat, match_evidence
 from .manager import EmbeddingManager
 from .matching import candidates, compare, confirmed_candidates, search_images
 from .provider import EmbeddingError, integer
@@ -184,11 +185,25 @@ class MultimodalMixin:
             if not skip:
                 if self.config.get("enable_llm_judge", True):
                     history, current, stats = self._build_judge_contexts(
-                        messages + [message], anchor["index"]
+                        messages + [message],
+                        anchor["index"],
+                        exact_matcher=exact_repeat,
                     )
-                    judge_content = message["content"] + (
-                        "\n[匹配依据：多模态语义/完整内容匹配。相似度不代表事实完全相同。"
-                        "没有提供历史原图；不可声称看到了图片细节。仅依据可见正文和上下文判断是否适合提醒。]"
+                    evidence = match_evidence(message, matched, anchor, self.config)
+                    judge_content = message["content"]
+                    self._mm_debug(
+                        trace,
+                        "judge_evidence",
+                        match_kind=anchor["kind"],
+                        match_score=anchor["score"],
+                        current_images=len(features["images"]),
+                        historical_images=len(matched["multimodal"].get("images", [])),
+                        repeat_basis=stats.get("repeat_basis"),
+                        exact_repeat_count=stats.get("exact_repeat_count"),
+                        exact_unique_senders=stats.get("exact_unique_senders"),
+                        longest_consecutive_exact=stats.get(
+                            "longest_consecutive_exact"
+                        ),
                     )
                     if message.get("image_description"):
                         judge_content += (
@@ -209,6 +224,7 @@ class MultimodalMixin:
                         current,
                         stats,
                         len(senders),
+                        match_evidence=evidence,
                         **(
                             {"diagnostics": judge_details}
                             if judge_details is not None
