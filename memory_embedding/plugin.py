@@ -74,7 +74,9 @@ class MultimodalMixin:
     def _embedding_manager(self):
         manager = getattr(self, "_mm_manager", None)
         if manager is None:
-            manager = self._mm_manager = EmbeddingManager(self.config, images=self._image_loader())
+            manager = self._mm_manager = EmbeddingManager(
+                self.config, images=self._image_loader()
+            )
         return manager
 
     async def _multimodal_vision(self, uri):

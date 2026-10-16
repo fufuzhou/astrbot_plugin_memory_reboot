@@ -4,7 +4,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import test_multimodal as fixtures
 from aiohttp import web
@@ -218,3 +218,33 @@ class ImageFallbackTests(unittest.IsolatedAsyncioTestCase):
         loader.close = AsyncMock()
         await plugin.terminate()
         loader.close.assert_awaited_once()
+
+    async def test_legacy_storage_reuses_hash_without_persisting_image(self):
+        plugin, _ = self.legacy_plugin_and_event()
+        event = types.SimpleNamespace(
+            get_group_id=lambda: "g",
+            get_sender_id=lambda: "user",
+            get_self_id=lambda: "bot",
+            get_sender_name=lambda: "Alice",
+            message_obj=types.SimpleNamespace(message_id="1"),
+        )
+        with (
+            patch.object(plugin, "_is_group_enabled", return_value=True),
+            patch.object(plugin, "_extract_content", new=AsyncMock(return_value={
+                "content": "[image description]", "has_image": True,
+                "image_source": "data:image/jpeg;base64,AAAA", "image_hash": "abc",
+            })),
+            patch.object(plugin, "_is_plugin_command", return_value=False),
+            patch.object(plugin, "_load_messages", return_value=[]),
+            patch.object(plugin, "_get_embedding", new=AsyncMock(return_value=None)),
+            patch.object(plugin, "_analyze_videos", new=AsyncMock(return_value=[])),
+            patch.object(plugin, "_compute_image_source_hash", new=AsyncMock()) as reload,
+            patch.object(plugin, "_append_message", new=AsyncMock()) as append,
+        ):
+            async for _ in plugin.on_group_message(event):
+                pass
+        reload.assert_not_awaited()
+        append.assert_awaited_once()
+        saved = append.await_args.args[1]
+        self.assertEqual(saved["image_hash"], "abc")
+        self.assertNotIn("data:image", str(saved))

@@ -175,3 +175,9 @@ SnowLuma 的 get_file 只解析图片/语音缓存，不能当作视频取回接
 当前 litert_lm 多模态路径按每张图片保留组件 path/url/file，随后追加同序原始 image 段的 path/url/file，最多6个并去重；仅当原始图片数与组件数相同才按顺序补充，避免错绑。路径缺失、解码失败、HTTP错误或权限限制后尝试同图下一个来源，成功即停止，只编码一次，不跨图片借用来源。全部失败标记该图缺失，其他图片仍可搜图。
 
 候选共享 embedding_timeout 总时间预算，保留原图片大小/像素/私网地址/目录限制，不因回退绕过这些限制。MultimodalDebug 的 image_source_attempt 展示候选编号、类型、耗时、结果，不输出路径/URL。旧 legacy 视觉转述路径本次未调整，也未增加 get_msg 刷新过期URL。本版安装包同时补齐原有提醒图片 1000101866.jpg。
+
+### 统一 legacy 图片加载（v3.11.6）
+
+普通图片的 legacy 与 litert_lm 路径现在共用来源收集及 ImageLoader，覆盖同图 path/url/file 和原始消息段回退。legacy 将成功加载并预处理的图片送入视觉模型，使用同次加载的 dHash；图片数据只驻留本次处理内存，不存入历史记录。识图返回表情包或失败时不改用同图其他地址重复识图。legacy 不创建 embedding provider，也无需 embedding API 配置。
+
+两种模式均遵循现有 multimodal_allowed_image_hosts、multimodal_local_image_roots、图片大小/像素和超时设置。legacy 的新图片哈希经过 EXIF 方向校正；旧历史哈希不改写，带旋转标记的旧图片可能与新哈希不同。未新增 get_msg 刷新URL，未改变视频和合并转发处理。
