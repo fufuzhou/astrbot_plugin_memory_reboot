@@ -6,7 +6,7 @@ import time
 
 import numpy as np
 
-from .provider import EmbeddingError, normalized
+from .provider import EmbeddingError, integer, normalized
 
 
 def clean_text(value):
@@ -133,6 +133,98 @@ def compare(current, stored, config):
     if a.get("fusion_vector") and b.get("fusion_vector"):
         scores.append(cosine(a["fusion_vector"], b["fusion_vector"]))
     return {"score": sum(scores) / len(scores), "kind": "semantic"}
+
+
+def recall_candidates(messages, current, config):
+    """Recall by any signal; whole-message confirmation happens after Top-K."""
+    a = current.get("multimodal") or {}
+    if a.get("schema") != 1 or not a.get("complete"):
+        return []
+    cutoff = time.time() - int(config.get("data_retention_days", 7)) * 86400
+    result = []
+    for index, message in enumerate(messages):
+        b = message.get("multimodal") or {}
+        if (
+            message.get("timestamp", 0) < cutoff
+            or b.get("schema") != 1
+            or not b.get("complete")
+        ):
+            continue
+        scores = []
+        at, bt = clean_text(a.get("text")), clean_text(b.get("text"))
+        if at and at == bt:
+            scores.append(1.0)
+        ai, bi = a.get("images", []), b.get("images", [])
+        for x in ai:
+            for y in bi:
+                if any(
+                    x.get(key) and x[key] == y.get(key)
+                    for key in ("sha256", "pixel_sha256")
+                ):
+                    scores.append(1.0)
+                elif x.get("dhash") and x["dhash"] == y.get("dhash"):
+                    scores.append(0.85)  # Recall only; never confirms a duplicate.
+        if a.get("space") and a["space"] == b.get("space"):
+            signals = [
+                (
+                    a.get("text_vector"),
+                    b.get("text_vector"),
+                    "multimodal_text_threshold",
+                    0.90,
+                )
+            ]
+            signals += [
+                (x.get("vector"), y.get("vector"), "multimodal_image_threshold", 0.94)
+                for x in ai
+                for y in bi
+            ]
+            signals += [
+                (
+                    a.get("text_vector"),
+                    y.get("vector"),
+                    "multimodal_cross_threshold",
+                    0.94,
+                )
+                for y in bi
+            ]
+            signals += [
+                (
+                    x.get("vector"),
+                    b.get("text_vector"),
+                    "multimodal_cross_threshold",
+                    0.94,
+                )
+                for x in ai
+            ]
+            signals.append(
+                (
+                    a.get("fusion_vector"),
+                    b.get("fusion_vector"),
+                    "multimodal_image_threshold",
+                    0.94,
+                )
+            )
+            for left, right, key, default in signals:
+                value = cosine(left, right)
+                if left and right and value >= threshold(config, key, default):
+                    scores.append(value)
+        if scores:
+            result.append({"score": max(scores), "index": index, "message": message})
+    result.sort(key=lambda item: (-item["score"], item["message"].get("timestamp", 0)))
+    return result[: integer(config, "multimodal_top_k", 10, 1, 50)]
+
+
+def confirmed_candidates(messages, current, config):
+    recalled = recall_candidates(messages, current, config)
+    confirmed = []
+    for item in recalled:
+        match = compare(current, item["message"], config)
+        if match:
+            confirmed.append({**item, **match})
+    return sorted(
+        confirmed,
+        key=lambda item: (-item["score"], item["message"].get("timestamp", 0)),
+    )
 
 
 def candidates(messages, current, config):

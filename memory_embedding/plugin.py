@@ -9,7 +9,7 @@ from astrbot.api import logger
 from astrbot.api.message_components import Plain, Reply
 
 from .manager import EmbeddingManager
-from .matching import candidates, compare, search_images
+from .matching import candidates, compare, confirmed_candidates, search_images
 from .provider import EmbeddingError, integer
 
 
@@ -94,15 +94,17 @@ class MultimodalMixin:
                 "multimodal": features,
             }
             messages = list(self._load_messages(group_id))
-            matches = await asyncio.to_thread(
-                candidates, messages, message, dict(self.config)
+            selected = await asyncio.to_thread(
+                confirmed_candidates, messages, message, dict(self.config)
             )
-            selected = matches[: integer(self.config, "multimodal_top_k", 10, 1, 50)]
             if not selected:
                 await self._append_message(group_id, message)
                 return
             anchor = selected[0]
             matched = anchor["message"]
+            matches = await asyncio.to_thread(
+                candidates, messages, message, dict(self.config)
+            )
             peers = [
                 m["message"]
                 for m in matches

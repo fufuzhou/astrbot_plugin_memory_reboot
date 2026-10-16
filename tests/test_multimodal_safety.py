@@ -268,3 +268,37 @@ class FeatureBoundaryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result[0]["_image_index"], 1)
         finally:
             await manager.close()
+
+
+class RecallTests(unittest.TestCase):
+    def test_recall_top_k_precedes_complete_confirmation(self):
+        from memory_embedding.matching import confirmed_candidates, recall_candidates
+
+        current = fixtures.message(
+            fixtures.features(images=[("a", [1, 0]), ("b", [0, 1])])
+        )
+        partial = fixtures.message(
+            fixtures.features(images=[("a", [1, 0]), ("x", [1, 0])]),
+            timestamp=time.time() - 9000,
+        )
+        complete = fixtures.message(
+            fixtures.features(images=[("a", [1, 0]), ("b", [0, 1])])
+        )
+        records = [partial, complete]
+        self.assertEqual(
+            len(recall_candidates(records, current, {"multimodal_top_k": 1})), 1
+        )
+        self.assertFalse(
+            confirmed_candidates(records, current, {"multimodal_top_k": 1})
+        )
+        found = confirmed_candidates(records, current, {"multimodal_top_k": 2})
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["index"], 1)
+
+    def test_dhash_only_recalls_without_confirming_or_crossing_spaces(self):
+        from memory_embedding.matching import confirmed_candidates, recall_candidates
+
+        a = fixtures.message(fixtures.features(images=[("a", [1, 0])]))
+        b = fixtures.message(fixtures.features(images=[("b", [0, 1])], space="other"))
+        self.assertEqual(len(recall_candidates([b], a, {})), 1)
+        self.assertFalse(confirmed_candidates([b], a, {}))
