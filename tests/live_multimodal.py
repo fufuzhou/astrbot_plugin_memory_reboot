@@ -22,7 +22,7 @@ def fixture(headline, detail, color="navy"):
         title = ImageFont.truetype("arial.ttf", 32)
         body = ImageFont.truetype("arial.ttf", 24)
     except OSError:
-        title = body = ImageFont.load_default(size=24)
+        title = body = ImageFont.load_default()
     draw.rectangle((0, 0, 900, 90), fill=color)
     draw.text((30, 25), "CITY NEWS", fill="white", font=title)
     draw.text((30, 140), headline, fill="black", font=title)
