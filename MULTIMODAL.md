@@ -1,4 +1,4 @@
-# EmbeddingGemma 2 多模态模式（v3.11.3）
+# EmbeddingGemma 2 多模态模式（v3.11.4）
 
 本次按讨论后的范围实现 **LiteLLM → LiteRT-LM → EmbeddingGemma 2 440M**。SiliconFlow、火山方舟留待有实际服务时接入，不提供尚未实现的配置选项。legacy 仍为默认模式。
 
@@ -74,7 +74,7 @@
 
 ## 验证与复现
 
-离线测试 93 项通过，其中原有回归 40 项。覆盖协议、错误、重试/缓存、空间隔离、多图匹配、缺图/超限、无描述搜图、图片访问限制、并发、群范围/人数/时间、压缩存储往返、旧精确路径及命令过滤。
+离线测试 99 项通过，其中原有回归 40 项。覆盖协议、错误、重试/缓存、空间隔离、多图匹配、缺图/超限、无描述搜图、图片访问限制、并发、群范围/人数/时间、压缩存储往返、旧精确路径及命令过滤。
 
 在仓库目录运行：
 
@@ -159,3 +159,13 @@ status 可区分 json_response、judge_provider_not_configured、judge_provider_
 LLM 请求在模板展开后追加匹配类型、完整消息匹配分数、图片数量及覆盖、正文情况和语义阈值。自定义 judge_prompt 也会收到这段证据；分数不是事实相同的概率。文字与单图跨模态会明确标注，不能误称两图逐张一致。仍不发送原图，只让 LLM 依据匹配证据及聊天上下文判断是否适合提醒。
 
 MultimodalDebug 新增 judge_evidence 阶段，记录匹配类型/分数、图片数量和精确复读统计，不输出提示词正文。人数、冷却、同发送者排除及最终判断开关均不改变。已验证实际构造的请求内容（Mock），尚未用运行中的群聊重新验证模型判断效果。
+
+### SnowLuma 视频兼容（v3.11.4）
+
+SnowLuma 的 get_file 只解析图片/语音缓存，不能当作视频取回接口：[官方文档](https://snowluma.github.io/zh/docs/api/extended/get_file)。使用该后端时，将新配置“视频文件取回后端” video_file_backend 设置为 snowluma，保存并重载。插件跳过 get_file，直接使用消息中的本地可读路径或 URL，沿用大小校验、SHA-256及五帧处理。该配置对 legacy 和多模态模式的视频均有效。
+
+默认 auto 保持原流程，但收到明确的 get_file only resolves cached image/voice ids 限制后，会按连接对象及账号缓存10分钟，期间跳过该视频取回接口，首次识别只输出 INFO。一般缓存未命中、retcode=100 或临时错误不会导致禁用。napcat 强制保持原 get_file 路径。缓存不写磁盘，重载清空。
+
+同时支持原始视频段的可读 path，并在组件 file 为不透明标识时优先使用原始 file 中的 HTTP URL。只有文件名/资源ID而没有可读路径或可下载URL时仍标记 unavailable，不把普通视频ID猜成群文件ID。真实下载或来源错误仍会保留诊断，未掩盖失败。video_debug_log 可查看 get_file 的 skipped/unsupported 状态及 download 结果。
+
+本次完成 Mock/本地文件回归；未连接用户运行中的 SnowLuma，实际消息URL及视频下载仍需安装后验证。前述 LLM / 多模态匹配规则未改。
