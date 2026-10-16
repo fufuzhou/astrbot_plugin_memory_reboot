@@ -5,6 +5,7 @@ Input: {"messages":[{"id":"a","text":"...", "images":["path-or-url"]}, ...],
 Use --online to encode inputs. Offline messages must include existing multimodal features.
 No credentials or message contents are included in the result.
 """
+
 import argparse
 import asyncio
 import json
@@ -34,9 +35,16 @@ async def evaluate(dataset, online=False, root=None):
             for record in records.values():
                 sources = record.get("images", [])
                 if root:
-                    sources = [str(root / s) if "://" not in s and not s.startswith("data:") else s for s in sources]
+                    sources = [
+                        str(root / s)
+                        if "://" not in s and not s.startswith("data:")
+                        else s
+                        for s in sources
+                    ]
                 start = time.perf_counter()
-                record["multimodal"] = await manager.features(record.get("text", ""), sources)
+                record["multimodal"] = await manager.features(
+                    record.get("text", ""), sources
+                )
                 latencies.append((time.perf_counter() - start) * 1000)
         finally:
             await manager.close()
@@ -47,12 +55,26 @@ async def evaluate(dataset, online=False, root=None):
             raise ValueError("duplicate labels must be boolean")
         match = compare(records[str(pair["a"])], records[str(pair["b"])], config)
         predicted, actual = match is not None, pair["duplicate"]
-        category = "tp" if predicted and actual else "fp" if predicted else "fn" if actual else "tn"
+        category = {
+            (True, True): "tp",
+            (True, False): "fp",
+            (False, True): "fn",
+            (False, False): "tn",
+        }[predicted, actual]
         counts[category] += 1
-        decisions.append({"a": pair["a"], "b": pair["b"], "expected": actual, "predicted": predicted,
-                          "score": match["score"] if match else None})
-    def ratio(a,b):
+        decisions.append(
+            {
+                "a": pair["a"],
+                "b": pair["b"],
+                "expected": actual,
+                "predicted": predicted,
+                "score": match["score"] if match else None,
+            }
+        )
+
+    def ratio(a, b):
         return a / b if b else None
+
     return {
         **counts,
         "precision": ratio(counts["tp"], counts["tp"] + counts["fp"]),

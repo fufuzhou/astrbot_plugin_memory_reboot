@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import base64
 import io
 import json
 import os
@@ -42,8 +43,6 @@ async def run():
     async def encode(image, name):
         output = io.BytesIO()
         image.save(output, format="PNG")
-        import base64
-
         uri = "data:image/png;base64," + base64.b64encode(output.getvalue()).decode()
         start = time.perf_counter()
         result = await manager.features("", [uri])
@@ -86,12 +85,49 @@ async def run():
                 (
                     await manager.images.load(
                         "data:image/png;base64,"
-                        + __import__("base64").b64encode(output.getvalue()).decode()
+                        + base64.b64encode(output.getvalue()).decode()
                     )
                 )["data_uri"]
             ],
         )
         assert caption["fusion_vector"]
+
+        def uri(image):
+            buffer = io.BytesIO()
+            image.save(buffer, format="PNG")
+            return (
+                "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+            )
+
+        original_uri = (await manager.images.load(uri(original)))["data_uri"]
+        unrelated_uri = (await manager.images.load(uri(unrelated)))["data_uri"]
+        multi_image = {}
+        for count in (2, 4):
+            before = await manager.provider.embed_multimodal("", [original_uri] * count)
+            after = await manager.provider.embed_multimodal(
+                "", [original_uri] * (count - 1) + [unrelated_uri]
+            )
+            similarity = cosine(before, after)
+            assert len(before) == len(after) == 768 and similarity < 0.999
+            multi_image[str(count)] = {
+                "dimension": len(before),
+                "last_image_change_cosine": similarity,
+            }
+        from evaluate_multimodal import evaluate
+
+        evaluation = await evaluate(
+            {
+                "messages": [
+                    {"id": name, "multimodal": f}
+                    for name, f in zip(("a", "b", "c", "d"), (a, b, c, d))
+                ],
+                "pairs": [
+                    {"a": "a", "b": "b", "duplicate": True},
+                    {"a": "a", "b": "c", "duplicate": False},
+                    {"a": "a", "b": "d", "duplicate": False},
+                ],
+            }
+        )
         records = [
             {"timestamp": time.time(), "message_id": str(i), "multimodal": f}
             for i, f in enumerate([a, d])
@@ -114,6 +150,8 @@ async def run():
                 m["message_id"]
                 for m in search_images(records, query, manager.provider.space, {})
             ],
+            "multi_image_fusion": multi_image,
+            "synthetic_pair_evaluation": evaluation,
             "joint_vector_dimension": len(caption["fusion_vector"]),
             "limits": "Synthetic smoke fixtures only; not a calibrated benchmark or real AstrBot acceptance.",
         }
