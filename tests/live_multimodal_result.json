@@ -1,0 +1,33 @@
+{
+  "capabilities": {
+    "provider": "litert_lm",
+    "model": "embeddinggemma-2-440m",
+    "text": true,
+    "image": true,
+    "text_image_fusion": true,
+    "multi_image_fusion": "unverified",
+    "dimensions": 768,
+    "space": "35a52e4b03c853b5192f60b17ac4dfd4f9df4ee8657aaa0536fc784d3543f2fa",
+    "max_images": 4,
+    "service_max_input_tokens": 1024
+  },
+  "timings_ms": {
+    "original": 992.05,
+    "resized_jpeg": 913.89,
+    "changed_numbers": 813.8,
+    "unrelated": 912.64
+  },
+  "scores": {
+    "resize_recompress": 0.9872507240855546,
+    "changed_numbers_same_layout": 0.9838936727948595,
+    "unrelated_same_news_layout": 0.8242238088884013,
+    "search_query_to_image": 0.8052669681268606,
+    "similarity_text_to_image": 0.7917929042110717
+  },
+  "search_rank": [
+    "0",
+    "1"
+  ],
+  "joint_vector_dimension": 768,
+  "limits": "Synthetic smoke fixtures only; not a calibrated benchmark or real AstrBot acceptance."
+}
