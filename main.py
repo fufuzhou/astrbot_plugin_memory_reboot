@@ -3953,8 +3953,8 @@ class MemoryRebootPlugin(MultimodalMixin, Star):
                         or getattr(comp, "url", None)
                         or getattr(comp, "file", None)
                     )
-                    if image_source:
-                        image_sources.append(image_source)
+                    if image_source or self._multimodal_enabled():
+                        image_sources.append(image_source or "")
                 elif isinstance(comp, Forward):
                     forward_components.append(comp)
 
@@ -4140,7 +4140,7 @@ class MemoryRebootPlugin(MultimodalMixin, Star):
         video_infos = result.get("video_infos") or []
 
         # 过滤：最小长度检查
-        if not image_source and not forward_id and not has_video:
+        if not image_source and not result.get("has_image") and not forward_id and not has_video:
             min_length = self.config.get("min_text_length", DEFAULT_MIN_TEXT_LENGTH)
             if len(content) < min_length:
                 logger.debug(f"[Memory Reboot] 跳过: 短文本({len(content)}<{min_length})")

@@ -44,7 +44,9 @@ class LiteRTProvider:
             self.url = self.url[:-len("/embeddings")]
         parsed = urlsplit(self.url)
         if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
-            raise EmbeddingError("invalid_api_url")
+            self.url_error = "invalid_api_url"
+        else:
+            self.url_error = ""
         self.model = str(config.get("embedding_model", "embeddinggemma-2-440m")).strip()
         self.dimension = integer(config, "embedding_dimensions", 768, 0, 16384)
         self.actual_dimension = self.dimension
@@ -87,6 +89,9 @@ class LiteRTProvider:
         }
 
     async def _request(self, content):
+        if self.url_error:
+            self.last_error = self.url_error
+            raise EmbeddingError(self.url_error)
         payload = {"model": self.model, "input": content, "encoding_format": "float"}
         if self.dimension:
             payload["dimensions"] = self.dimension
@@ -135,6 +140,8 @@ class LiteRTProvider:
                     raise EmbeddingError(self.last_error) from None
 
     async def embed_text(self, text, task="similarity"):
+        if len(text.encode("utf-8")) > integer(self.config, "embedding_max_text_bytes", 900, 64, 20000):
+            raise EmbeddingError("text_budget_exceeded")
         prefix = "task: search query | text: " if task == "search" else "task: sentence similarity | text: "
         return await self._request(prefix + text.strip())
 
@@ -142,6 +149,8 @@ class LiteRTProvider:
         return await self._request([{"type": "image_url", "image_url": {"url": image}}])
 
     async def embed_multimodal(self, text, images):
+        if len(text.encode("utf-8")) > integer(self.config, "embedding_max_text_bytes", 900, 64, 20000):
+            raise EmbeddingError("text_budget_exceeded")
         if len(images) != 1:
             raise EmbeddingError("multi_image_fusion_unverified")
         parts = []
