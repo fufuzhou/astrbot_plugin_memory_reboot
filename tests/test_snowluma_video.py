@@ -114,7 +114,7 @@ class SnowLumaVideoTests(unittest.IsolatedAsyncioTestCase):
         action = AsyncMock()
         event = self.event(action)
         event.message_obj.message = [
-            fixtures.Video(file="opaque", path="/unreadable/path")
+            fixtures._Video(file="opaque", path="/unreadable/path")
         ]
         event.message_obj.raw_message = {
             "message": [
@@ -134,6 +134,14 @@ class SnowLumaVideoTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["sha256"], self.digest)
         action.assert_not_awaited()
         self.plugin._download_video.assert_not_awaited()
+        event.message_obj.raw_message = {
+            "message": [
+                {"type": "video", "data": {"file": "https://example.test/raw-file.mp4"}}
+            ]
+        }
+        source = self.plugin._extract_video_components(event)[0]
+        self.assertEqual(source["source_method"], "raw_file_url")
+        self.assertEqual(source["source"], "https://example.test/raw-file.mp4")
 
     async def test_missing_url_does_not_guess_group_file_api(self):
         self.plugin.config["video_file_backend"] = "snowluma"
