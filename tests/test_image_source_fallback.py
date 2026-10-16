@@ -139,3 +139,82 @@ class ImageFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             p._image_sources(event), [["a-local", "a-url"], "b-local"]
         )
+
+
+    def legacy_plugin_and_event(self):
+        plugin = object.__new__(fixtures.MemoryRebootPlugin)
+        plugin.config = {}
+        plugin._cache = {}
+        plugin._image_to_text = AsyncMock(return_value=("description", "content"))
+        event = types.SimpleNamespace(
+            message_str="",
+            message_obj=types.SimpleNamespace(
+                message=[fixtures.MessageImage(path="missing", url="valid", file="unused")],
+                raw_message={},
+            ),
+        )
+        return plugin, event
+
+    async def test_legacy_fallback_recognizes_once_and_reuses_hash(self):
+        plugin, event = self.legacy_plugin_and_event()
+        loader = plugin._image_loader()
+        loader.load = AsyncMock(side_effect=[
+            EmbeddingError("image_load_failed"),
+            {"data_uri": "data:image/jpeg;base64,AAAA", "dhash": "abc"},
+        ])
+        try:
+            result = await plugin._extract_content(event)
+            self.assertEqual(result["image_hash"], "abc")
+            self.assertEqual(result["image_description"], "description")
+            plugin._image_to_text.assert_awaited_once_with("data:image/jpeg;base64,AAAA")
+            self.assertEqual([c.args[0] for c in loader.load.await_args_list],
+                             ["missing", "valid"])
+            self.assertFalse(hasattr(plugin, "_mm_manager"))
+        finally:
+            await plugin.terminate()
+
+    async def test_legacy_sticker_does_not_retry_other_sources(self):
+        plugin, event = self.legacy_plugin_and_event()
+        plugin._image_to_text.return_value = None
+        loader = plugin._image_loader()
+        loader.load = AsyncMock(return_value={"data_uri": "inline", "dhash": "abc"})
+        try:
+            self.assertIsNone(await plugin._extract_content(event))
+            loader.load.assert_awaited_once_with("missing")
+            plugin._image_to_text.assert_awaited_once_with("inline")
+        finally:
+            await plugin.terminate()
+
+    async def test_legacy_failed_image_continues_to_next_image(self):
+        plugin, event = self.legacy_plugin_and_event()
+        event.message_obj.message.append(fixtures.MessageImage(url="second-image"))
+        loader = plugin._image_loader()
+        loader.load = AsyncMock(side_effect=[
+            EmbeddingError("image_load_failed"),
+            EmbeddingError("image_http_404"),
+            EmbeddingError("image_load_failed"),
+            {"data_uri": "second-inline", "dhash": "def"},
+        ])
+        try:
+            result = await plugin._extract_content(event)
+            self.assertEqual(result["image_hash"], "def")
+            plugin._image_to_text.assert_awaited_once_with("second-inline")
+        finally:
+            await plugin.terminate()
+
+    async def test_backends_share_loader_and_close_it_once(self):
+        plugin, _ = self.legacy_plugin_and_event()
+        plugin.config["embedding_api_url"] = "http://unused/v1"
+        loader = plugin._image_loader()
+        loader.close = AsyncMock()
+        manager = plugin._embedding_manager()
+        self.assertIs(manager.images, loader)
+        await plugin.terminate()
+        loader.close.assert_awaited_once()
+
+    async def test_legacy_only_closes_loader(self):
+        plugin, _ = self.legacy_plugin_and_event()
+        loader = plugin._image_loader()
+        loader.close = AsyncMock()
+        await plugin.terminate()
+        loader.close.assert_awaited_once()
