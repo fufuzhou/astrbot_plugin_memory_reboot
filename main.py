@@ -2963,19 +2963,19 @@ class MemoryRebootPlugin(MultimodalMixin, Star):
             record_judge("judge_provider_not_configured")
             logger.debug("[Memory Reboot] LLM判断: 未配置judge_provider_id，跳过判断")
             return False
-        
+
         try:
             provider = self.context.get_provider_by_id(provider_id)
             if not provider:
                 record_judge("judge_provider_not_found")
                 logger.debug(f"[Memory Reboot] LLM判断: 未找到provider={provider_id}")
                 return False
-            
+
             def fmt(m):
                 ts = m.get('timestamp', 0)
                 time_str = self._format_time(ts) if ts else "??:??:??"
                 return f"[{time_str}] {m.get('sender_name', '?')}: {m.get('content', '')}"
-            
+
             history_str = "\n".join([fmt(m) for m in history_ctx])
             current_str = "\n".join([fmt(m) for m in current_ctx])
             if not history_str:
@@ -2985,14 +2985,14 @@ class MemoryRebootPlugin(MultimodalMixin, Star):
             context_stats_str = self._format_judge_context_stats(
                 context_stats
             )
-            
+
             matched_time_ago = self._format_time_ago(matched_msg.get("timestamp", 0))
             matched_sender = matched_msg.get("sender_name", "未知")
             matched_content = matched_msg.get("content", "")[:300]
             min_senders = self.config.get("min_unique_senders", 3)
-            
+
             prompt_template = self.config.get("judge_prompt") or self.DEFAULT_JUDGE_PROMPT
-            
+
             try:
                 prompt = prompt_template.format(
                     matched_time=self._format_time(matched_msg.get("timestamp", 0)),
@@ -3016,7 +3016,7 @@ class MemoryRebootPlugin(MultimodalMixin, Star):
                 )
 
             response = await provider.text_chat(prompt=prompt, contexts=[])
-            
+
             if response and response.completion_text:
                 text = response.completion_text
                 if "```" in text:

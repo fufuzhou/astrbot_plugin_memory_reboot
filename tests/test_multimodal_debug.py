@@ -22,7 +22,7 @@ class DebugTests(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue(await case.process())
                     if value is True:
                         rows = [
-                            json.loads(c.args[0].split("] ", 2)[-1])
+                            json.loads(c.args[0].split("[MultimodalDebug] ", 1)[1])
                             for c in log.info.call_args_list
                         ]
                         self.assertIn("candidate", [r["stage"] for r in rows])
@@ -115,7 +115,7 @@ class DebugTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(results)
                 text = log.info.call_args.args[0]
                 self.assertNotIn("SECRET_QUERY", text)
-                row = json.loads(text.split("] ", 2)[-1])
+                row = json.loads(text.split("[MultimodalDebug] ", 1)[1])
                 self.assertTrue(row["keyword_fallback"])
                 self.assertEqual(row["error"], "embedding_http_401")
                 self.assertEqual(row["results"], 0)
@@ -170,7 +170,7 @@ class JudgeReasonTests(unittest.IsolatedAsyncioTestCase):
                     self.assertFalse(await case.process())
                     if active:
                         rows = [
-                            json.loads(c.args[0].split("] ", 2)[-1])
+                            json.loads(c.args[0].split("[MultimodalDebug] ", 1)[1])
                             for c in log.info.call_args_list
                         ]
                         row = next(r for r in rows if r["stage"] == "llm_judge")
