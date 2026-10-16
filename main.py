@@ -4167,6 +4167,9 @@ class MemoryRebootPlugin(MultimodalMixin, Star):
         if self._multimodal_enabled() and not (
             forward_id or forward_truncated or forward_partial or has_video or url_only
         ):
+            # The group observer must not store our command invocations as memories.
+            if re.fullmatch(r"[/!#\.。]?(?:搜图|嵌入测试|记忆状态|查看过滤命令|擦除记忆)(?:\s.*)?", content.strip(), re.S):
+                return
             async for response in self._on_multimodal_message(
                 event, result, group_id, sender_id, sender_name
             ):

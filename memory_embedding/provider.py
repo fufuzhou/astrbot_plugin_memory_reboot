@@ -29,6 +29,8 @@ def normalized(value, dimension=0):
     if any(isinstance(x, bool) or not isinstance(x, (int, float)) for x in value):
         raise EmbeddingError("invalid_vector")
     vector = np.asarray(value, dtype=np.float64)
+    if vector.ndim != 1:
+        raise EmbeddingError("invalid_vector")
     norm = np.linalg.norm(vector)
     if not np.isfinite(vector).all() or not math.isfinite(norm) or norm <= 0:
         raise EmbeddingError("invalid_vector")

@@ -159,7 +159,7 @@ def search_images(messages, query_vector, space, config):
         for index, image in enumerate(features.get("images", [])):
             try:
                 rows.append(normalized(image.get("vector"), len(query_vector)))
-                owners.append((message, index))
+                owners.append((message, image.get("source_index", index)))
             except EmbeddingError:
                 continue
     if not rows:

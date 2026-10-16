@@ -51,13 +51,14 @@ class EmbeddingManager:
                 )
             uris = []
             excluded = 0
-            for source in sources[:limit]:
+            for source_index, source in enumerate(sources[:limit]):
                 try:
                     image = await self.images.load(source)
                 except EmbeddingError as exc:
                     self.last_error = str(exc)
                     result["complete"] = False
                     continue
+                image["source_index"] = source_index
                 uri = image.pop("data_uri")
                 if vision:
                     description = await vision(uri)

@@ -199,6 +199,15 @@ class EntryPointTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("1.0000", replies[0])
         provider.embed_text.assert_awaited_once_with("cat", task="search")
 
+    async def test_own_commands_never_become_memories(self):
+        for content in ("/搜图 park", "/嵌入测试", "记忆状态"):
+            self.plugin._extract_content = AsyncMock(
+                return_value={"content": content, "raw_text": content}
+            )
+            self.assertFalse(
+                [r async for r in self.plugin.on_group_message(self.event)]
+            )
+
     async def test_filtering_precedes_multimodal_network(self):
         self.plugin._extract_content = AsyncMock(
             return_value={"content": "/skip", "raw_text": "/skip"}
@@ -230,3 +239,32 @@ class EvaluationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["recall"], 0.5)
         self.assertEqual(result["false_positive_rate"], 0.5)
         self.assertNotIn("private", json.dumps(result))
+
+
+class FeatureBoundaryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_matrix_is_not_a_single_embedding(self):
+        from memory_embedding.provider import normalized
+
+        with self.assertRaises(EmbeddingError):
+            normalized([[1, 0], [0, 1]])
+
+    async def test_partial_search_preserves_original_image_position(self):
+        from memory_embedding.matching import search_images
+
+        manager = EmbeddingManager({"embedding_api_url": "http://unused/v1"})
+        manager.images.load = AsyncMock(
+            side_effect=[
+                EmbeddingError("missing_image"),
+                {"data_uri": "data:image/png;base64,AA==", "sha256": "second"},
+            ]
+        )
+        manager.provider.embed_image = AsyncMock(return_value=[1, 0])
+        try:
+            feature = await manager.features("", ["missing", "second"])
+            self.assertFalse(feature["complete"])
+            result = search_images(
+                [fixtures.message(feature)], [1, 0], feature["space"], {}
+            )
+            self.assertEqual(result[0]["_image_index"], 1)
+        finally:
+            await manager.close()
