@@ -5,17 +5,18 @@
     "text": true,
     "image": true,
     "text_image_fusion": true,
-    "multi_image_fusion": "unverified",
+    "multi_image_fusion": true,
+    "max_fusion_images": 4,
     "dimensions": 768,
     "space": "35a52e4b03c853b5192f60b17ac4dfd4f9df4ee8657aaa0536fc784d3543f2fa",
     "max_images": 4,
     "service_max_input_tokens": 1024
   },
   "timings_ms": {
-    "original": 992.05,
-    "resized_jpeg": 913.89,
-    "changed_numbers": 813.8,
-    "unrelated": 912.64
+    "original": 990.75,
+    "resized_jpeg": 912.82,
+    "changed_numbers": 802.98,
+    "unrelated": 925.02
   },
   "scores": {
     "resize_recompress": 0.9872507240855546,
@@ -28,6 +29,49 @@
     "0",
     "1"
   ],
+  "multi_image_fusion": {
+    "2": {
+      "dimension": 768,
+      "last_image_change_cosine": 0.972323410491251
+    },
+    "4": {
+      "dimension": 768,
+      "last_image_change_cosine": 0.9497583854592744
+    }
+  },
+  "synthetic_pair_evaluation": {
+    "tp": 1,
+    "fp": 1,
+    "tn": 1,
+    "fn": 0,
+    "precision": 0.5,
+    "recall": 1.0,
+    "false_positive_rate": 0.5,
+    "median_encoding_ms": null,
+    "pairs": [
+      {
+        "a": "a",
+        "b": "b",
+        "expected": true,
+        "predicted": true,
+        "score": 0.9872507240855546
+      },
+      {
+        "a": "a",
+        "b": "c",
+        "expected": false,
+        "predicted": true,
+        "score": 0.9838936727948595
+      },
+      {
+        "a": "a",
+        "b": "d",
+        "expected": false,
+        "predicted": false,
+        "score": null
+      }
+    ]
+  },
   "joint_vector_dimension": 768,
   "limits": "Synthetic smoke fixtures only; not a calibrated benchmark or real AstrBot acceptance."
 }
