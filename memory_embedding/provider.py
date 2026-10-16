@@ -42,7 +42,10 @@ class LiteRTProvider:
         self.url = str(config.get("embedding_api_url", "")).strip().rstrip("/")
         if self.url.endswith("/embeddings"):
             self.url = self.url[:-len("/embeddings")]
-        parsed = urlsplit(self.url)
+        try:
+            parsed = urlsplit(self.url)
+        except ValueError:
+            parsed = urlsplit("")
         if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
             self.url_error = "invalid_api_url"
         else:
@@ -59,7 +62,7 @@ class LiteRTProvider:
         self.signature = {
             "schema": 1, "model": self.model,
             "revision": str(config.get("embedding_model_revision", "local-v1")),
-            "endpoint": self.url,
+            "endpoint": self.url if not self.url_error else "invalid",
             "strategy": "eg2-shared-images-v1",
             "preprocessing": "exif-rgb-jpeg90-v1",
             "max_side": integer(config, "multimodal_max_side", 1024, 224, 2048),

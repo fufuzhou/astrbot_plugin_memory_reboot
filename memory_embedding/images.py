@@ -117,7 +117,7 @@ class ImageLoader:
                     str(image.size).encode() + image.tobytes()
                 ).hexdigest()
                 small = image.convert("L").resize((17, 16), Image.Resampling.LANCZOS)
-                values = list(small.getdata())
+                values = list(small.tobytes())
                 bits = "".join("1" if values[y*17+x] > values[y*17+x+1] else "0" for y in range(16) for x in range(16))
                 dhash = f"{int(bits, 2):064x}"
                 image.thumbnail((self.side, self.side), Image.Resampling.LANCZOS)

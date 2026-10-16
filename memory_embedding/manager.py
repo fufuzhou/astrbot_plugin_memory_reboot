@@ -29,7 +29,8 @@ class EmbeddingManager:
                 "schema": 1, "provider": "litert_lm", "model": self.provider.model,
                 "revision": self.provider.signature["revision"],
                 "encoding": dict(self.provider.signature),
-                "task": "similarity", "text": text, "images": [],
+                "task": "similarity", "modalities": (["text"] if text else []) + (["image"] if sources else []),
+                "text": text, "images": [],
                 "image_count": len(sources), "complete": len(sources) <= limit,
                 "text_vector": None, "fusion_vector": None, "descriptions": [],
             }
