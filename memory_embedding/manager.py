@@ -9,10 +9,10 @@ from .provider import EmbeddingError, LiteRTProvider, integer
 
 
 class EmbeddingManager:
-    def __init__(self, config):
+    def __init__(self, config, images=None):
         self.config = dict(config)
         self.provider = LiteRTProvider(config)
-        self.images = ImageLoader(config)
+        self.images = images if images is not None else ImageLoader(config)
         self.last_error = ""
         self.workers = asyncio.Semaphore(
             integer(config, "embedding_max_concurrency", 2, 1, 8)

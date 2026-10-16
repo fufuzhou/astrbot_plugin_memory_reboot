@@ -1,10 +1,10 @@
 # Memory Reboot - 记忆重现
 
-> AstrBot 旧闻提醒插件 v3.11.5
+> AstrBot 旧闻提醒插件 v3.11.6
 
 当群聊中有人重复发送旧的新闻、话题、梗图或视频时，自动识别并通过引用回复提醒该用户。
 
-## v3.11.5 原生多模态模式
+## v3.11.6 原生多模态模式
 
 新增 LiteLLM / LiteRT-LM + EmbeddingGemma 2 后端，直接编码全部图片，查重与 /搜图 共用图片向量，无需强制视觉转述。默认仍为 legacy；请按 [多模态部署、配置、验证与回滚说明](MULTIMODAL.md) 启用。SiliconFlow / 火山方舟暂未实现。
 
@@ -520,3 +520,9 @@ s11IM、idiotsj
 
 
 
+
+### v3.11.6 图片加载统一
+
+legacy 与原生多模态共用图片来源收集和加载器：按 path、url、file 及同张图片的原始消息段来源依次尝试，成功后停止。legacy 使用加载后的图片识图，并复用本次计算的哈希，不再重复下载；识图失败或判定为表情包不会触发同张图片的来源重试。
+
+图片大小、超时、本地路径和私网主机限制现在也适用于 legacy；私网图片服务请配置 multimodal_allowed_image_hosts，本地共享目录请配置 multimodal_local_image_roots。legacy 无需配置 embedding API。

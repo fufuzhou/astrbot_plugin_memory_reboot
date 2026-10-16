@@ -353,6 +353,8 @@ class MemoryRebootPlugin(MultimodalMixin, Star):
         manager = getattr(self, "_mm_manager", None)
         if manager is not None:
             await manager.close()
+        elif getattr(self, "_shared_image_loader", None) is not None:
+            await self._shared_image_loader.close()
         logger.info("[Memory Reboot] 资源已清理")
     
     def _setup_data_directory(self):
@@ -4006,20 +4008,12 @@ class MemoryRebootPlugin(MultimodalMixin, Star):
     ) -> Optional[Dict]:
         """提取普通消息或合并转发内容。"""
         text = event.message_str.strip() if event.message_str else ""
-        image_sources = []
+        image_sources = self._image_sources(event)
         forward_components = []
         video_infos = self._extract_video_components(event)
         if hasattr(event, "message_obj") and event.message_obj:
             for comp in event.message_obj.message:
-                if isinstance(comp, Image):
-                    image_source = (
-                        getattr(comp, "path", None)
-                        or getattr(comp, "url", None)
-                        or getattr(comp, "file", None)
-                    )
-                    if image_source or self._multimodal_enabled():
-                        image_sources.append(image_source or "")
-                elif isinstance(comp, Forward):
+                if isinstance(comp, Forward):
                     forward_components.append(comp)
 
         if forward_components:
@@ -4101,7 +4095,6 @@ class MemoryRebootPlugin(MultimodalMixin, Star):
             }
 
         if self._multimodal_enabled():
-            image_sources = self._multimodal_image_sources(event)
             # Use actual Plain segments, never platform-generated media placeholders.
             components = getattr(getattr(event, "message_obj", None), "message", [])
             plain = [str(getattr(comp, "text", "")) for comp in components if isinstance(comp, Plain)]
@@ -4117,19 +4110,25 @@ class MemoryRebootPlugin(MultimodalMixin, Star):
 
         if image_sources:
             for image_source in image_sources:
-                result = await self._image_to_text(image_source)
+                try:
+                    image = await self._image_loader().load_candidates(image_source)
+                except EmbeddingError as exc:
+                    logger.warning(f"[Memory Reboot] 图片所有来源加载失败: {exc}")
+                    continue
+                result = await self._image_to_text(image["data_uri"])
                 if result:
                     img_text, _ = result
                     content = f"{text} [图片内容: {img_text}]" if text else f"[图片内容: {img_text}]"
                     logger.debug(f"[Memory Reboot] 图片转文本成功")
                     return {
                         "content": content,
-                        "image_source": image_source,
+                        "image_source": image["data_uri"],
+                        "image_hash": image["dhash"],
                         "image_description": img_text,
                         "has_image": True,
                     }
                 else:
-                    logger.info(f"[Memory Reboot] 跳过表情包")
+                    logger.info("[Memory Reboot] 图片未生成有效描述（表情包或识图失败）")
             if not text:
                 logger.debug(f"[Memory Reboot] 无有效内容，跳过")
                 return None
@@ -4337,9 +4336,10 @@ class MemoryRebootPlugin(MultimodalMixin, Star):
             embedding = await self._get_embedding(embedding_content)
         logger.debug(f"[Memory Reboot] Embedding: {'成功获取' if embedding else '获取失败'}, 维度={len(embedding) if embedding else 0}")
         now = time.time()
-        image_hash = None
+        image_hash = result.get("image_hash")
         if image_source:
-            image_hash = await self._compute_image_source_hash(image_source)
+            if image_hash is None:
+                image_hash = await self._compute_image_source_hash(image_source)
             logger.debug(
                 f"[Memory Reboot] 图片哈希: {'成功' if image_hash else '失败'}"
             )

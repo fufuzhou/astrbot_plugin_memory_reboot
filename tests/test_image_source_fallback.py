@@ -131,11 +131,11 @@ class ImageFallbackTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         self.assertEqual(
-            p._multimodal_image_sources(event),
+            p._image_sources(event),
             [["a-local", "a-url", "a-raw"], ["b-local", "b-raw"]],
         )
         event.message_obj.raw_message["message"].pop()
         # Do not guess source alignment when the adapter changes image count.
         self.assertEqual(
-            p._multimodal_image_sources(event), [["a-local", "a-url"], "b-local"]
+            p._image_sources(event), [["a-local", "a-url"], "b-local"]
         )

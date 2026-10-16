@@ -9,6 +9,7 @@ from astrbot.api import logger
 from astrbot.api.message_components import Image, Plain, Reply
 
 from .diagnostics import elapsed, enabled, safe_reason
+from .images import ImageLoader
 from .judge import exact_repeat, match_evidence
 from .manager import EmbeddingManager
 from .matching import candidates, compare, confirmed_candidates, search_images
@@ -25,7 +26,7 @@ class MultimodalMixin:
                 )
             )
 
-    def _multimodal_image_sources(self, event):
+    def _image_sources(self, event):
         message = getattr(event, "message_obj", None)
         images = [c for c in getattr(message, "message", []) if isinstance(c, Image)]
         raw = getattr(message, "raw_message", None)
@@ -64,10 +65,16 @@ class MultimodalMixin:
     def _multimodal_enabled(self):
         return self.config.get("embedding_backend", "legacy") == "litert_lm"
 
+    def _image_loader(self):
+        loader = getattr(self, "_shared_image_loader", None)
+        if loader is None:
+            loader = self._shared_image_loader = ImageLoader(self.config)
+        return loader
+
     def _embedding_manager(self):
         manager = getattr(self, "_mm_manager", None)
         if manager is None:
-            manager = self._mm_manager = EmbeddingManager(self.config)
+            manager = self._mm_manager = EmbeddingManager(self.config, images=self._image_loader())
         return manager
 
     async def _multimodal_vision(self, uri):
