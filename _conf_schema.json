@@ -380,5 +380,16 @@
     "type": "bool",
     "default": false,
     "hint": "临时开启后以 INFO 输出编码耗时、候选分数/拒绝原因、人数和冷却判定及搜图结果；不输出正文、图片数据和 Key。排查完成后关闭。"
+  },
+  "video_file_backend": {
+    "description": "视频文件取回后端",
+    "type": "string",
+    "default": "auto",
+    "options": [
+      "auto",
+      "snowluma",
+      "napcat"
+    ],
+    "hint": "SnowLuma请选择snowluma：跳过不支持视频的get_file，直接用消息路径/URL。auto仅在明确图片/语音限制错误后，对当前连接和账号缓存10分钟；napcat保留原get_file流程。"
   }
 }

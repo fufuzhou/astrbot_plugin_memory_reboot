@@ -136,9 +136,11 @@ IMAGE_SEARCH_DESCRIPTION_MAX_CHARS = 160   # 搜图结果中描述的最大长�
 # ==============================================================================
 
 if __package__:
+    from .video_compat import VideoFileCapabilities, image_voice_only
     from .memory_embedding.plugin import MultimodalMixin
     from .memory_embedding.provider import EmbeddingError
 else:
+    from video_compat import VideoFileCapabilities, image_voice_only
     from memory_embedding.plugin import MultimodalMixin
     from memory_embedding.provider import EmbeddingError
 
@@ -1431,6 +1433,8 @@ class MemoryRebootPlugin(MultimodalMixin, Star):
                 raw_file
                 or component_file
             )
+            raw_path = str(raw_data.get("path") or "").strip()
+            local_raw_path = self._local_video_path(raw_path)
             local_component_path = self._local_video_path(component_path)
             if (
                 local_component_path
@@ -1438,12 +1442,18 @@ class MemoryRebootPlugin(MultimodalMixin, Star):
             ):
                 source = component_path
                 source_method = "component_path"
+            elif local_raw_path and os.path.isfile(local_raw_path):
+                source = raw_path
+                source_method = "raw_path"
             elif raw_url:
                 source = raw_url
                 source_method = "raw_url"
             elif component_url:
                 source = component_url
                 source_method = "component_url"
+            elif raw_file.startswith(("http://", "https://")):
+                source = raw_file
+                source_method = "raw_file_url"
             elif component_file:
                 source = component_file
                 source_method = "component_file"
@@ -1538,6 +1548,27 @@ class MemoryRebootPlugin(MultimodalMixin, Star):
         if self_id:
             routing_params["self_id"] = self_id
 
+        backend = str(self.config.get("video_file_backend", "auto")).lower()
+        capabilities = getattr(self, "_video_file_capabilities", None)
+        if capabilities is None:
+            capabilities = self._video_file_capabilities = VideoFileCapabilities()
+        skip_reason = capabilities.skip_reason(backend, bot, self_id)
+        if skip_reason:
+            if diagnostics is not None:
+                diagnostics.update(outcome="skipped", reason=skip_reason)
+            return None
+
+        def record_unsupported(value):
+            if not image_voice_only(value):
+                return False
+            if backend == "auto":
+                capabilities.remember_unsupported(bot, self_id)
+            if diagnostics is not None:
+                diagnostics.update(outcome="unsupported", reason="image_voice_only")
+            logger.info("[Memory Reboot] 协议端 get_file 仅支持图片/语音；"
+                        "视频改用消息中的路径或URL。可设置 video_file_backend=snowluma 跳过探测。")
+            return True
+
         if diagnostics is not None:
             diagnostics.pop("reason", None)
             diagnostics.update(
@@ -1556,6 +1587,8 @@ class MemoryRebootPlugin(MultimodalMixin, Star):
                 timeout=DEFAULT_VIDEO_DOWNLOAD_TIMEOUT,
             )
         except Exception as exc:
+            if record_unsupported(exc):
+                return None
             if diagnostics is not None:
                 diagnostics.update(
                     outcome="error",
@@ -1579,6 +1612,15 @@ class MemoryRebootPlugin(MultimodalMixin, Star):
                 for key in ("status", "retcode", "wording")
                 if isinstance(result, dict) and key in result
             }
+        if isinstance(result, dict) and (
+            result.get("status") == "failed" or result.get("retcode", 0) not in (0, None)
+        ):
+            if record_unsupported(result):
+                return None
+            if diagnostics is not None:
+                diagnostics.update(outcome="error", reason="onebot_failed_response")
+            logger.warning("[Memory Reboot] get_file 返回失败状态，继续尝试消息视频来源")
+            return None
         data = self._onebot_response_data(result)
         if not data:
             if diagnostics is not None:
@@ -1730,6 +1772,7 @@ class MemoryRebootPlugin(MultimodalMixin, Star):
         """判断来源是否由当前消息的组件或get_file直接绑定。"""
         return video_info.get("source_method") in {
             "component_path",
+            "raw_path",
             "get_file_local",
             "get_file_http",
         }
@@ -2140,7 +2183,7 @@ class MemoryRebootPlugin(MultimodalMixin, Star):
                 else:
                     logger.warning(
                         "[Memory Reboot] 视频来源不可读，且未能通过 "
-                        "get_file 取回"
+                        "协议端取回（需消息携带可访问的视频URL或共享路径）"
                     )
                     return self._new_video_fingerprint(
                         resolved_info,
