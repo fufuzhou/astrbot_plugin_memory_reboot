@@ -852,6 +852,80 @@ class VideoDuplicateTests(unittest.IsolatedAsyncioTestCase):
             summary,
         )
 
+    def test_reminder_summary_shows_saved_image_description(self):
+        matched = {
+            "sender_name": "历史发送者",
+            "timestamp": 1234567890,
+            "content": "[图片×1]",
+            "has_image": True,
+            "image_description": "新闻截图：某公司发布新模型",
+        }
+
+        with (
+            patch.object(self.plugin, "_format_time", return_value="07-29 12:34:56"),
+            patch.object(self.plugin, "_format_time_ago", return_value="5分钟前"),
+        ):
+            summary = self.plugin._build_message_summary(matched)
+
+        self.assertIn("🖼️ 图片内容：新闻截图：某公司发布新模型", summary)
+
+    def test_reminder_summary_labels_multiple_image_descriptions(self):
+        matched = {
+            "sender_name": "历史发送者",
+            "timestamp": 1234567890,
+            "content": "[图片×2]",
+            "has_image": True,
+            "multimodal": {
+                "images": [
+                    {"sha256": "first", "description": "第一张描述"},
+                    {"sha256": "second", "description": "第二张描述"},
+                ]
+            },
+        }
+
+        with (
+            patch.object(self.plugin, "_format_time", return_value="07-29 12:34:56"),
+            patch.object(self.plugin, "_format_time_ago", return_value="5分钟前"),
+        ):
+            summary = self.plugin._build_message_summary(matched)
+
+        self.assertIn("图1：第一张描述；图2：第二张描述", summary)
+
+    def test_reminder_summary_does_not_duplicate_legacy_description(self):
+        matched = {
+            "sender_name": "历史发送者",
+            "timestamp": 1234567890,
+            "content": "[图片内容: 旧版内嵌描述]",
+            "has_image": True,
+            "image_description": "旧版内嵌描述",
+        }
+
+        with (
+            patch.object(self.plugin, "_format_time", return_value="07-29 12:34:56"),
+            patch.object(self.plugin, "_format_time_ago", return_value="5分钟前"),
+        ):
+            summary = self.plugin._build_message_summary(matched)
+
+        self.assertEqual(summary.count("旧版内嵌描述"), 1)
+        self.assertNotIn("🖼️", summary)
+
+    def test_reminder_summary_marks_old_multimodal_record_without_description(self):
+        matched = {
+            "sender_name": "历史发送者",
+            "timestamp": 1234567890,
+            "content": "[图片×1]",
+            "has_image": True,
+            "multimodal": {"images": [{"sha256": "fingerprint"}]},
+        }
+
+        with (
+            patch.object(self.plugin, "_format_time", return_value="07-29 12:34:56"),
+            patch.object(self.plugin, "_format_time_ago", return_value="5分钟前"),
+        ):
+            summary = self.plugin._build_message_summary(matched)
+
+        self.assertIn("🖼️ 图片内容：未保存", summary)
+
     async def test_local_video_promotes_to_perceptual_after_five_frames(self):
         video_path = os.path.join(self.temp_dir.name, "sample.mp4")
         with open(video_path, "wb") as file:

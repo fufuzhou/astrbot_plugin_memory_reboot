@@ -96,15 +96,25 @@ class MultimodalMixin:
                 ),
                 timeout=integer(self.config, "embedding_timeout", 30, 1, 180),
             )
-            content = response.completion_text.strip()
+            content = str(getattr(response, "completion_text", "") or "").strip()
+            if not content:
+                return None
             fence = chr(96) * 3
             if fence in content:
                 content = content.split(fence)[1].removeprefix("json").strip()
-            value = json.loads(content)
+            try:
+                value = json.loads(content)
+            except (TypeError, ValueError):
+                # Some providers ignore the JSON instruction. Keep the text as an
+                # approximate description rather than discarding a paid response.
+                return content[:2000]
+            if not isinstance(value, dict):
+                return content[:2000]
             sticker = str(value.get("is_sticker")).lower() == "true"
             if sticker and self.config.get("multimodal_sticker_filter_enabled", False):
                 return False
-            return str(value.get("content", ""))[:2000]
+            description = str(value.get("content") or "").strip()
+            return description[:2000] or None
         except Exception:
             logger.warning("[Memory Reboot] optional vision classification failed")
             return None
@@ -121,9 +131,13 @@ class MultimodalMixin:
             except EmbeddingError as exc:
                 logger.warning(f"[Memory Reboot] multimodal configuration: {exc}")
                 return
-            use_vision = self.config.get(
-                "multimodal_sticker_filter_enabled", False
-            ) or self.config.get("multimodal_vision_fallback_enabled", False)
+            description_enabled = self.config.get(
+                "multimodal_vision_fallback_enabled", True
+            )
+            use_vision = (
+                self.config.get("multimodal_sticker_filter_enabled", False)
+                or description_enabled
+            ) and bool(self.config.get("vision_provider_id", ""))
             trace = uuid.uuid4().hex[:12]
             start = time.perf_counter()
             self._mm_debug(
@@ -155,7 +169,11 @@ class MultimodalMixin:
                     trace, "decision", remind=False, reason="empty_after_filter"
                 )
                 return
-            descriptions = features.pop("descriptions", [])
+            descriptions = [
+                str(value).strip()
+                for value in (features.pop("descriptions", []) or [])
+                if str(value or "").strip()
+            ]
             now = time.time()
             message = {
                 "id": str(uuid.uuid4()),
@@ -353,12 +371,26 @@ class MultimodalMixin:
             yield event.plain_result(f"没找到与“{query}”相关的图片记录")
             return
         matched = matches[0]
+        index = matched.get("_image_index")
+        description = ""
+        features = matched.get("multimodal") or {}
+        images = features.get("images") or []
+        if isinstance(index, int):
+            by_source = {
+                image.get("source_index", position): image
+                for position, image in enumerate(images)
+                if isinstance(image, dict)
+            }
+            image = by_source.get(index)
+            if image is not None:
+                description = str(image.get("description") or "").strip()
         description = (
-            self._get_image_description(matched) or "无图片描述（按原生图片向量检索）"
+            description
+            or self._get_image_description(matched)
+            or "无图片描述（按原生图片向量检索）"
         )
         score = matched.get("_image_search_semantic_similarity")
         score_text = f"\n相似度：{score:.4f}" if score is not None else ""
-        index = matched.get("_image_index")
         position = f" · 原消息第{index + 1}张图" if index is not None else ""
         details = (
             f"找到{len(matches)}个图片结果{position}\n{description[:160]}"
@@ -387,9 +419,21 @@ class MultimodalMixin:
                 + sum(bool(i.get("vector")) for i in f.get("images", []))
                 for f in current
             )
+            described = sum(
+                bool(image.get("description"))
+                for f in current
+                for image in f.get("images", [])
+            )
+            description_on = bool(
+                self.config.get("vision_provider_id")
+            ) and bool(
+                self.config.get("multimodal_vision_fallback_enabled", True)
+            )
             return (
                 f"LiteRT-LM / {manager.provider.model} / {manager.provider.actual_dimension}维"
                 f" / 当前空间向量{count}个 / 最近错误：{manager.last_error or manager.provider.last_error or '无'}"
+                f" / 图片描述：{'开启' if description_on else '关闭'}"
+                f"（已保存{described}张）"
                 f" / 调试日志：{'开启' if enabled(self.config) else '关闭'}"
                 "\n阈值待校准；逐图向量与搜图共用；最多4图补充融合"
             )

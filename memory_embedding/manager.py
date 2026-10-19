@@ -129,7 +129,12 @@ class EmbeddingManager:
                         excluded += 1
                         continue
                     if description:
-                        result["descriptions"].append(str(description))
+                        text_description = str(description).strip()
+                        if text_description:
+                            result["descriptions"].append(text_description)
+                            # Keep the description next to its image so reminders
+                            # and /搜图 can show the matching image's caption.
+                            image["description"] = text_description
                 image["vector"] = await self._embed(
                     self.provider.embed_image(uri),
                     diagnostics,

@@ -1,4 +1,4 @@
-# EmbeddingGemma 2 多模态模式（v3.11.5）
+# EmbeddingGemma 2 多模态模式（v3.11.7）
 
 本次按讨论后的范围实现 **LiteLLM → LiteRT-LM → EmbeddingGemma 2 440M**。SiliconFlow、火山方舟留待有实际服务时接入，不提供尚未实现的配置选项。legacy 仍为默认模式。
 
@@ -20,7 +20,7 @@
 | multimodal_fusion_enabled | true |
 | multimodal_max_images | 4 |
 | multimodal_sticker_filter_enabled | false |
-| multimodal_vision_fallback_enabled | false |
+| multimodal_vision_fallback_enabled | true |
 
 地址供 192.168.50.x 局域网客户端使用；ZeroTier 客户端可改用 http://10.147.17.5:4000/v1，本次实测走后者。可配置能直达的 LiteRT-LM Base URL，模型名须与入口实际名称一致。Key 仅配置面板掩码显示，不等于加密存储；源码、历史消息和测试结果不保存 Key。embedding_provider_id 仅用于旧后端。
 
@@ -40,7 +40,7 @@
 - 默认 3 名不同发送者，同发送者排除，以及“现在减去命中历史消息时间至少 3600 秒”保持原逻辑，没有改成最近提醒时间的冷却。
 - enable_llm_judge、judge_provider_id 沿用原配置。上下文判断模型不会被告知它看过未提供的历史图片。
 - 按本次讨论，semantic_auto_remind 默认 true：关闭 LLM 后，符合完整内容匹配、人数及时间条件的语义近似也可提醒。改为 false 后，无 LLM 时仅精确重复提醒。
-- 普通图片不调用视觉 LLM。开启表情包过滤或图片描述后，才逐图额外调用 vision_provider_id；识别失败不当作表情包。额外调用可能产生费用。
+- 普通图片默认调用一次视觉 LLM 生成并保存描述（multimodal_vision_fallback_enabled=true），提醒消息会显示历史图片描述，便于人工判断是否误判。该调用需要 vision_provider_id，可能产生费用；关闭后普通图片不调用视觉 LLM。开启表情包过滤时也会逐图调用；识别失败不当作表情包，也不丢弃图片向量。
 - URL、视频、合并转发沿用原精确指纹/视频路径，占位文本不送入新后端。
 - 新特征写入 multimodal/schema=1；旧 embedding 不覆盖，新记录的旧 embedding 为 null。保留文件 SHA-256、像素 SHA-256、dHash；新模式不以 dHash 单独决定重复。
 - 不持久保存原图/Base64。缺少原图的历史图片不强行补建向量；搜图保留旧描述关键词/字符匹配兜底。
@@ -181,3 +181,11 @@ SnowLuma 的 get_file 只解析图片/语音缓存，不能当作视频取回接
 普通图片的 legacy 与 litert_lm 路径现在共用来源收集及 ImageLoader，覆盖同图 path/url/file 和原始消息段回退。legacy 将成功加载并预处理的图片送入视觉模型，使用同次加载的 dHash；图片数据只驻留本次处理内存，不存入历史记录。识图返回表情包或失败时不改用同图其他地址重复识图。legacy 不创建 embedding provider，也无需 embedding API 配置。
 
 两种模式均遵循现有 multimodal_allowed_image_hosts、multimodal_local_image_roots、图片大小/像素和超时设置。legacy 的新图片哈希经过 EXIF 方向校正；旧历史哈希不改写，带旋转标记的旧图片可能与新哈希不同。未新增 get_msg 刷新URL，未改变视频和合并转发处理。
+
+### 提醒展示图片描述（v3.11.7）
+
+多模态模式默认开启 `multimodal_vision_fallback_enabled`：每张成功加载的图片会额外调用一次 `vision_provider_id`，生成描述并随消息保存。描述写入逐图字段 `multimodal.images[].description`，聚合值仍写入 `image_description`，旧版内嵌 `[图片内容: ...]` 继续可读。
+
+重复提醒在历史消息正文后追加 `🖼️ 图片内容：...`；多图按 `图1：`、`图2：` 标注，单图描述最多120字符、总体最多400字符，超出截断。这样无需打开原图也能判断匹配是否误报。`/搜图` 命中多图记录时优先显示被命中那张图的描述。
+
+关闭 `multimodal_vision_fallback_enabled` 后新图片不再调用视觉模型；没有描述的历史记录仍只显示 `[图片×N]`。升级前已保存的多模态记录没有原图，无法补生成描述，提醒会标注“未保存（旧记录或识图未成功）”；新记录不受影响。视觉调用失败不影响图片向量、查重和搜图，只缺少该图描述。

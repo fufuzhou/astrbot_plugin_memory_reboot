@@ -128,6 +128,8 @@ DEFAULT_URL_TRACKING_PARAMS = [
 ]
 REMINDER_IMAGE_FILENAME = "1000101866.jpg" # 提醒图片文件名
 REMINDER_SUMMARY_MAX_CHARS = 80             # 提醒摘要正文最大长度
+REMINDER_IMAGE_DESCRIPTION_MAX_CHARS = 120  # 提醒摘要中单张图片描述最大长度
+REMINDER_IMAGE_DESCRIPTION_TOTAL_MAX_CHARS = 400  # 提醒摘要中图片描述总长度上限
 IMAGE_SEARCH_DESCRIPTION_MAX_CHARS = 160   # 搜图结果中描述的最大长度
 
 
@@ -1119,15 +1121,44 @@ class MemoryRebootPlugin(MultimodalMixin, Star):
             return 0.0
 
     @staticmethod
-    def _get_image_description(message: Dict) -> str:
-        """读取独立图片描述，并兼容旧记录的内嵌格式。"""
-        description = str(message.get("image_description") or "").strip()
+    def _normalize_image_description(value) -> str:
+        """将图片描述压缩为单行，避免提醒摘要出现多余空行。"""
+        return re.sub(r"\s+", " ", str(value or "")).strip()
+
+    @classmethod
+    def _stored_image_descriptions(cls, message: Dict) -> List[str]:
+        """读取每张图片的独立描述，并兼容旧的聚合字段和内嵌格式。"""
+        features = message.get("multimodal")
+        if isinstance(features, dict):
+            descriptions = []
+            for image in features.get("images") or []:
+                if not isinstance(image, dict):
+                    continue
+                value = cls._normalize_image_description(
+                    image.get("description")
+                )
+                if value:
+                    descriptions.append(value)
+            if descriptions:
+                return descriptions
+
+        description = cls._normalize_image_description(
+            message.get("image_description")
+        )
         if description:
-            return description
+            return [description]
 
         content = str(message.get("content") or "")
         match = re.search(r"\[图片内容:\s*(.*?)\]\s*$", content, re.DOTALL)
-        return match.group(1).strip() if match else ""
+        if not match:
+            return []
+        description = cls._normalize_image_description(match.group(1))
+        return [description] if description else []
+
+    @classmethod
+    def _get_image_description(cls, message: Dict) -> str:
+        """读取独立图片描述，并兼容旧记录的内嵌格式。"""
+        return "\n".join(cls._stored_image_descriptions(message))
 
     @staticmethod
     def _normalize_image_search_text(value: object) -> str:
@@ -3935,6 +3966,39 @@ class MemoryRebootPlugin(MultimodalMixin, Star):
             "reused": False,
         }
     
+    def _format_reminder_image_content(self, matched_msg: Dict, content: str) -> str:
+        """在提醒里展示已保存的图片描述，避免只剩[图片×N]占位符。"""
+        descriptions = self._stored_image_descriptions(matched_msg)
+        if descriptions:
+            # 旧记录的描述已经内嵌在正文里时不要重复展示。
+            if all(description in content for description in descriptions):
+                return ""
+            rendered = []
+            for index, description in enumerate(descriptions, 1):
+                if len(description) > REMINDER_IMAGE_DESCRIPTION_MAX_CHARS:
+                    description = (
+                        description[:REMINDER_IMAGE_DESCRIPTION_MAX_CHARS].rstrip()
+                        + "…"
+                    )
+                prefix = f"图{index}：" if len(descriptions) > 1 else ""
+                rendered.append(prefix + description)
+            text = "；".join(rendered)
+            if len(text) > REMINDER_IMAGE_DESCRIPTION_TOTAL_MAX_CHARS:
+                text = (
+                    text[:REMINDER_IMAGE_DESCRIPTION_TOTAL_MAX_CHARS].rstrip()
+                    + "…"
+                )
+            return f"\n🖼️ 图片内容：{text}"
+
+        features = matched_msg.get("multimodal")
+        if (
+            matched_msg.get("has_image")
+            and isinstance(features, dict)
+            and features.get("images")
+        ):
+            return "\n🖼️ 图片内容：未保存（旧记录或识图未成功）"
+        return ""
+
     def _build_message_summary(self, matched_msg: Dict) -> str:
         """生成匹配到的历史消息摘要。"""
         sender_name = str(matched_msg.get("sender_name") or "未知")
@@ -3951,7 +4015,10 @@ class MemoryRebootPlugin(MultimodalMixin, Star):
         except (TypeError, ValueError, OverflowError, OSError):
             time_text = "时间未知"
 
-        content = re.sub(r"\s+", " ", str(matched_msg.get("content") or "")).strip()
+        raw_content = re.sub(
+            r"\s+", " ", str(matched_msg.get("content") or "")
+        ).strip()
+        content = raw_content
         if not content:
             content = "（无文字内容）"
         elif len(content) > REMINDER_SUMMARY_MAX_CHARS:
@@ -3970,7 +4037,9 @@ class MemoryRebootPlugin(MultimodalMixin, Star):
             details.append("含图片")
         if matched_msg.get("has_video"):
             details.append("含视频")
-        return f"\n\n📌 {' · '.join(details)}\n{content}"
+        summary = f"\n\n📌 {' · '.join(details)}\n{content}"
+        summary += self._format_reminder_image_content(matched_msg, raw_content)
+        return summary
 
     async def _send_reminder(self, event: AstrMessageEvent, matched_msg: Dict):
         """发送提醒图片，并附上匹配到的历史消息摘要。"""

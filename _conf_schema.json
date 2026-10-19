@@ -33,7 +33,7 @@
   "vision_provider_id": {
     "description": "图像识别模型提供商【需要视觉能力】",
     "type": "string",
-    "hint": "⚠️ 需要具备视觉能力的模型！用于识别图片类型（emoji跳过，meme/content记录）",
+    "hint": "⚠️ 需要具备视觉能力的模型！用于识别图片类型、过滤表情包，并生成图片描述。多模态模式下默认开启图片描述；每张图片调用一次视觉模型，可能产生费用。",
     "default": "",
     "_special": "select_provider"
   },
@@ -192,7 +192,7 @@
   "vision_prompt": {
     "description": "图片识别提示词",
     "type": "text",
-    "hint": "判断图片是否为纯表情包(跳过)或内容图(记录)，返回JSON格式。留空则使用内置默认提示词。",
+    "hint": "用于判断图片是否为纯表情包（跳过）或内容图，并生成图片描述；返回JSON格式。留空则使用内置默认提示词。",
     "default": ""
   },
   "judge_prompt": {
@@ -325,13 +325,13 @@
     "description": "可选视觉表情包过滤",
     "type": "bool",
     "default": false,
-    "hint": "需要 vision_provider_id；关闭时不调用视觉模型。识别失败不当作表情包。"
+    "hint": "需要 vision_provider_id；开启后视觉模型判定为表情包的图片会被跳过。关闭后不因表情包过滤而跳过图片，但「保存图片描述」开启时仍会调用视觉模型生成描述。识别失败不当作表情包。"
   },
   "multimodal_vision_fallback_enabled": {
-    "description": "可选生成图片描述",
+    "description": "保存图片描述",
     "type": "bool",
-    "default": false,
-    "hint": "启用后每张成功加载的图额外调用视觉模型，不是查重或搜图必需。"
+    "default": true,
+    "hint": "开启后每张成功加载的图片额外调用 vision_provider_id 生成描述，保存到记录并显示在重复提醒和搜图中，便于判断是否误判；需要配置「图像识别模型提供商」，可能产生 API 费用。关闭后新图片不再生成描述，没有描述的历史记录仍只显示[图片×N]。"
   },
   "multimodal_text_threshold": {
     "description": "文本重复阈值（待校准）",

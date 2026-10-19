@@ -289,6 +289,20 @@ class ImageAndManagerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result["image_count"], 0)
 
+    async def test_vision_description_is_attached_to_its_image(self):
+        vision = AsyncMock(side_effect=["first description", "second description"])
+        result = await self.manager.features(
+            "", [str(self.image), str(self.image)], vision
+        )
+        self.assertEqual(
+            result["descriptions"], ["first description", "second description"]
+        )
+        self.assertEqual(
+            [image["description"] for image in result["images"]],
+            ["first description", "second description"],
+        )
+        self.assertEqual(vision.await_count, 2)
+
     async def test_image_pixel_limit_and_recompression_hash(self):
         self.manager.images.pixels = 10
         with self.assertRaisesRegex(EmbeddingError, "pixel"):
@@ -364,6 +378,86 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.f = features(images=[("a", [1, 0])], complete=False)
         self.seed()
         self.assertFalse(await self.process())
+
+    async def test_vision_description_is_enabled_by_default(self):
+        self.plugin.config["vision_provider_id"] = "vision"
+        self.seed()
+        await self.process()
+        self.assertIsNotNone(
+            self.plugin._mm_manager.features.await_args.args[2]
+        )
+
+    async def test_multimodal_vision_parses_json_and_plain_text(self):
+        provider = types.SimpleNamespace(
+            text_chat=AsyncMock(
+                return_value=types.SimpleNamespace(
+                    completion_text=(
+                        '```json\n{"is_sticker": false, '
+                        '"content": "新闻截图"}\n```'
+                    )
+                )
+            )
+        )
+        self.plugin.config["vision_provider_id"] = "vision"
+        self.plugin.context = types.SimpleNamespace(
+            get_provider_by_id=lambda _: provider
+        )
+        self.assertEqual(
+            await self.plugin._multimodal_vision("data:image/jpeg;base64,AAAA"),
+            "新闻截图",
+        )
+        provider.text_chat.return_value = types.SimpleNamespace(
+            completion_text="纯文本描述"
+        )
+        self.assertEqual(
+            await self.plugin._multimodal_vision("data:image/jpeg;base64,AAAA"),
+            "纯文本描述",
+        )
+        self.plugin.config["multimodal_sticker_filter_enabled"] = True
+        provider.text_chat.return_value = types.SimpleNamespace(
+            completion_text='{"is_sticker": true, "content": "表情包"}'
+        )
+        self.assertIs(
+            await self.plugin._multimodal_vision("data:image/jpeg;base64,AAAA"),
+            False,
+        )
+        provider.text_chat.return_value = types.SimpleNamespace(
+            completion_text=""
+        )
+        self.assertIsNone(
+            await self.plugin._multimodal_vision("data:image/jpeg;base64,AAAA")
+        )
+
+    async def test_vision_description_can_be_disabled(self):
+        self.plugin.config.update(
+            vision_provider_id="vision",
+            multimodal_vision_fallback_enabled=False,
+        )
+        self.seed()
+        await self.process()
+        self.assertIsNone(
+            self.plugin._mm_manager.features.await_args.args[2]
+        )
+
+    async def test_image_descriptions_are_persisted_for_reminders(self):
+        self.f = features(images=[("a", [1, 0]), ("b", [0, 1])])
+        self.f["descriptions"] = ["first description", "second description"]
+        self.f["images"][0]["description"] = "first description"
+        self.f["images"][1]["description"] = "second description"
+        self.seed()
+        await self.process()
+        stored = self.plugin._cache["g"]["messages"][-1]
+        self.assertEqual(
+            stored["image_description"],
+            "first description\nsecond description",
+        )
+        self.assertEqual(
+            [
+                image.get("description")
+                for image in stored["multimodal"]["images"]
+            ],
+            ["first description", "second description"],
+        )
 
     async def test_new_fields_round_trip_without_overwriting_old_embedding(self):
         legacy = {
