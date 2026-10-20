@@ -8,12 +8,13 @@ help: |
 
   可选通过 LiteLLM 接入 EmbeddingGemma 2 原生图文向量，图片查重和搜图共用向量
   默认为图片保存视觉描述，重复提醒会显示历史图片内容，便于判断是否误判
+  默认按图片主要用途区分表情包和内容图，单格带字表情包也会被跳过
   使用文本Embedding、图片哈希和视频分层指纹进行重复内容检测
   支持在当前群的图片描述中进行关键词、字符模糊和Embedding语义搜索
   可选使用LLM判断区分复读/接龙和真正的旧闻（可关闭以节省token）
   自动过滤其他插件的命令，避免误判
   管理命令仅限管理员使用
   优化正则匹配策略为全词匹配，支持精准关键词过滤
-version: v3.11.7
+version: v3.11.8
 author: s11IM、idiotsj
 repo: https://github.com/s11IM/astrbot_plugin_memory_reboot
