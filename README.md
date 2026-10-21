@@ -1,8 +1,14 @@
 # Memory Reboot - 记忆重现
 
-> AstrBot 旧闻提醒插件 v3.11.8
+> AstrBot 旧闻提醒插件 v3.11.9
 
 当群聊中有人重复发送旧的新闻、话题、梗图或视频时，自动识别并通过引用回复提醒该用户。
+
+## v3.11.9 视觉判定日志
+
+- `vision` 阶段新增 `classified_sticker`、`raw_is_sticker`、`json_ok`、`sticker_source`、`content_chars`，可直接看到视觉模型是否判为表情包。
+- 兼容只接收 `uri` 的旧版 vision 回调，避免只替换部分文件时因参数不匹配报 `TypeError`。
+- 文本判断模型的 `result/status/reason` 仍然在 `llm_judge` 阶段输出。
 
 ## v3.11.8 表情包判断提示词调整
 

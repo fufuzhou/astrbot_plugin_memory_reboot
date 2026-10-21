@@ -326,6 +326,13 @@ class ImageAndManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["sticker_source"], "is_sticker")
         self.assertEqual(row["content_chars"], 12)
 
+    async def test_legacy_one_argument_vision_callback_still_works(self):
+        async def vision(_uri):
+            return "description"
+
+        result = await self.manager.features("", [str(self.image)], vision)
+        self.assertEqual(result["descriptions"], ["description"])
+
     async def test_image_pixel_limit_and_recompression_hash(self):
         self.manager.images.pixels = 10
         with self.assertRaisesRegex(EmbeddingError, "pixel"):

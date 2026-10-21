@@ -1,4 +1,4 @@
-# EmbeddingGemma 2 多模态模式（v3.11.8）
+# EmbeddingGemma 2 多模态模式（v3.11.9）
 
 本次按讨论后的范围实现 **LiteLLM → LiteRT-LM → EmbeddingGemma 2 440M**。SiliconFlow、火山方舟留待有实际服务时接入，不提供尚未实现的配置选项。legacy 仍为默认模式。
 
@@ -197,3 +197,9 @@ SnowLuma 的 get_file 只解析图片/语音缓存，不能当作视频取回接
 默认 `vision_prompt` 改为按图片主要用途判断：新闻、截图、数据、公告、教程、具体事件叙述及普通实拍照片记录；网络表情包、反应图、单格梗图即使带文字也跳过。旧版“不确定就判为内容图”的偏向已移除，避免带字表情包被反复放过。
 
 如果配置里自定义过 `vision_prompt`，该字段会覆盖内置默认值；要使用新版默认提示词，请清空该配置后重载。提示词只能降低视觉模型在边界样本上的摇摆，不能保证同一张图每次返回完全一致；如需对重复表情包做确定性过滤，仍需额外的指纹缓存。
+
+### 视觉判定日志与回调兼容（v3.11.9）
+
+`vision` 阶段现在输出模型原始判定：`classified_sticker`、`raw_is_sticker`、`json_ok`、`sticker_source` 和 `content_chars`。不输出图片正文或完整模型回复。若日志中完全没有 `vision` 阶段，优先检查是否只替换了 `plugin.py` 或 `manager.py` 其中一个文件，以及是否有 `_multimodal_vision() takes ...` 之类的 TypeError。
+
+`manager.py` 同时兼容只接收 `uri` 的旧版 vision 回调。只替换部分文件时不会再因参数数量不匹配而中断，但只有 `plugin.py` 与 `manager.py` 同时更新才会出现新增的判定字段。

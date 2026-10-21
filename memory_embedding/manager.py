@@ -1,11 +1,35 @@
 """Feature extraction, bounded vector cache and provider lifetime."""
 
 import asyncio
+import inspect
 import time
 
 from .diagnostics import elapsed, enabled
 from .images import ImageLoader
 from .provider import EmbeddingError, LiteRTProvider, integer
+
+
+def accepts_vision_info(vision):
+    """Support both the new (uri, info) and legacy (uri) vision callbacks."""
+    try:
+        parameters = list(inspect.signature(vision).parameters.values())
+    except (TypeError, ValueError):
+        return False
+    if any(
+        parameter.kind is inspect.Parameter.VAR_POSITIONAL
+        for parameter in parameters
+    ):
+        return True
+    positional = [
+        parameter
+        for parameter in parameters
+        if parameter.kind
+        in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+    ]
+    return len(positional) >= 2
 
 
 class EmbeddingManager:
@@ -115,7 +139,10 @@ class EmbeddingManager:
                 if vision:
                     start = time.perf_counter()
                     vision_info = {}
-                    description = await vision(uri, vision_info)
+                    if accepts_vision_info(vision):
+                        description = await vision(uri, vision_info)
+                    else:
+                        description = await vision(uri)
                     if diagnostics is not None:
                         diagnostics.append(
                             {
