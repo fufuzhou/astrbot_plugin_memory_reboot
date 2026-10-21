@@ -313,6 +313,9 @@ class ImageAndManagerTests(unittest.IsolatedAsyncioTestCase):
                 json_ok=True,
                 sticker_source="is_sticker",
                 content_chars=12,
+                response_chars=40,
+                response_preview='{"is_sticker": true}',
+                content_preview="description",
             )
             return "description"
 
@@ -325,6 +328,9 @@ class ImageAndManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(row["json_ok"], True)
         self.assertEqual(row["sticker_source"], "is_sticker")
         self.assertEqual(row["content_chars"], 12)
+        self.assertEqual(row["response_chars"], 40)
+        self.assertEqual(row["response_preview"], '{"is_sticker": true}')
+        self.assertEqual(row["content_preview"], "description")
 
     async def test_legacy_one_argument_vision_callback_still_works(self):
         async def vision(_uri):
@@ -442,6 +448,9 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(info["sticker"], False)
         self.assertIs(info["json_ok"], True)
         self.assertEqual(info["raw_is_sticker"], "False")
+        self.assertEqual(info["content_preview"], "新闻截图")
+        self.assertIn('"is_sticker": false', info["response_preview"])
+        self.assertGreater(info["response_chars"], 0)
 
         provider.text_chat.return_value = types.SimpleNamespace(
             completion_text="纯文本描述"
@@ -456,6 +465,8 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(info["sticker"])
         self.assertIs(info["json_ok"], False)
         self.assertEqual(info["sticker_source"], "parse_failed")
+        self.assertEqual(info["content_preview"], "纯文本描述")
+        self.assertEqual(info["response_preview"], "纯文本描述")
 
         self.plugin.config["multimodal_sticker_filter_enabled"] = True
         provider.text_chat.return_value = types.SimpleNamespace(
@@ -470,6 +481,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIs(info["sticker"], True)
         self.assertEqual(info["sticker_source"], "is_sticker")
+        self.assertEqual(info["content_preview"], "表情包")
 
         provider.text_chat.return_value = types.SimpleNamespace(
             completion_text='{"is_sticker": "yes", "content": "表情包"}'
@@ -483,6 +495,18 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIs(info["sticker"], True)
         self.assertEqual(info["raw_is_sticker"], "yes")
+
+        provider.text_chat.return_value = types.SimpleNamespace(
+            completion_text=(
+                '{"is_sticker": false, "content": "见 https://private.example/x"}'
+            )
+        )
+        info = {}
+        await self.plugin._multimodal_vision(
+            "data:image/jpeg;base64,AAAA", info
+        )
+        self.assertNotIn("https://private.example", info["content_preview"])
+        self.assertIn("[resource]", info["content_preview"])
 
         provider.text_chat.return_value = types.SimpleNamespace(
             completion_text=""

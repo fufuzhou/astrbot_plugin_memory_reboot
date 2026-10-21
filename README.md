@@ -1,8 +1,14 @@
 # Memory Reboot - 记忆重现
 
-> AstrBot 旧闻提醒插件 v3.11.9
+> AstrBot 旧闻提醒插件 v3.11.10
 
 当群聊中有人重复发送旧的新闻、话题、梗图或视频时，自动识别并通过引用回复提醒该用户。
+
+## v3.11.10 视觉返回预览
+
+- `vision` 阶段新增 `response_preview`（模型原始返回，最多500字符）、`content_preview`（解析后的 content，最多300字符）和 `response_chars`。
+- 预览会遮盖 API Key、URL/Base64 资源，但可能包含图片描述、OCR 文字或聊天内容；仅在调试时开启 `multimodal_debug_log`。
+- 这样可以直接看到模型为什么判 `is_sticker: false`，而不是只看到布尔值。
 
 ## v3.11.9 视觉判定日志
 

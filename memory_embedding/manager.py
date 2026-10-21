@@ -156,6 +156,9 @@ class EmbeddingManager:
                                 "json_ok": vision_info.get("json_ok"),
                                 "sticker_source": vision_info.get("sticker_source"),
                                 "content_chars": vision_info.get("content_chars"),
+                                "response_chars": vision_info.get("response_chars"),
+                                "response_preview": vision_info.get("response_preview"),
+                                "content_preview": vision_info.get("content_preview"),
                             }
                         )
                     if description is False:  # Explicit sticker classification only.

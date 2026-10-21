@@ -84,6 +84,9 @@ class MultimodalMixin:
             if info is not None:
                 info.update(fields)
 
+        def preview(value, limit):
+            return safe_reason(value, self.config)[:limit]
+
         provider_id = self.config.get("vision_provider_id", "")
         if not provider_id:
             record(sticker=None, json_ok=False, sticker_source="no_provider")
@@ -106,13 +109,17 @@ class MultimodalMixin:
                 ),
                 timeout=integer(self.config, "embedding_timeout", 30, 1, 180),
             )
-            content = str(getattr(response, "completion_text", "") or "").strip()
+            raw_response = str(
+                getattr(response, "completion_text", "") or ""
+            ).strip()
+            content = raw_response
             if not content:
                 record(
                     sticker=None,
                     json_ok=False,
                     sticker_source="empty_response",
                     content_chars=0,
+                    response_chars=0,
                 )
                 return None
             fence = chr(96) * 3
@@ -126,6 +133,9 @@ class MultimodalMixin:
                     json_ok=False,
                     sticker_source="parse_failed",
                     content_chars=len(content),
+                    response_chars=len(raw_response),
+                    response_preview=preview(raw_response, 500),
+                    content_preview=preview(content, 300),
                 )
                 return content[:2000]
             if not isinstance(value, dict):
@@ -134,6 +144,9 @@ class MultimodalMixin:
                     json_ok=False,
                     sticker_source="non_object",
                     content_chars=len(content),
+                    response_chars=len(raw_response),
+                    response_preview=preview(raw_response, 500),
+                    content_preview=preview(content, 300),
                 )
                 return content[:2000]
             raw_sticker = value.get("is_sticker", "<missing>")
@@ -152,6 +165,9 @@ class MultimodalMixin:
                 json_ok=True,
                 sticker_source=sticker_source,
                 content_chars=len(description),
+                response_chars=len(raw_response),
+                response_preview=preview(raw_response, 500),
+                content_preview=preview(description, 300),
             )
             if sticker and self.config.get("multimodal_sticker_filter_enabled", False):
                 return False
