@@ -140,6 +140,8 @@ Remove-Item Env:EMBEDDING_API_KEY
 
 每条处理链使用随机 trace 串联：start → image_load/text_embedding/image_embedding/fusion_embedding → features → candidate → matching → gates → llm_judge → decision。搜图使用 search，记录结果数、前10项分数、是否退回关键词搜索及接口错误。逐图 image_index 从0开始。编码耗时包括缓存命中时的调用耗时，不等于纯模型推理耗时。
 
+vision 阶段新增 classified_sticker（模型是否判为表情包）、raw_is_sticker（模型原始字段值，最多20字符）、json_ok（是否成功解析 JSON）、sticker_source（is_sticker/type/parse_failed/empty_response/error 等）和 content_chars（描述字符数）。这些字段不包含图片正文或原始回复，用于区分“模型明确判 false”和“返回格式无法解析/未判为表情包”。
+
 candidate 记录召回分数、确认分数、文本/图片配对分数和拒绝原因；只记录召回 Top-K，不输出全部历史。常见拒绝原因：numbers_conflict（正文数字冲突）、image_coverage_or_threshold（图片不能完整匹配或未达阈值）、caption_presence_mismatch（正文有无不同）、caption_below_threshold、different_vector_space。matching 的 recalled=0 表示没有进入 Top-K 的候选，可能是保留期、空间、完整性或召回阈值条件不符，不等于服务故障。
 
 gates 展示不同发送者人数、同发送者条件、历史年龄及冷却秒数；decision 展示最终是否计划提醒。该日志不证明消息已成功送达。/记忆状态 同时显示调试开关状态。

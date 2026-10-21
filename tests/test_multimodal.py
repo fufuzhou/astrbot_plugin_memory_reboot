@@ -303,6 +303,29 @@ class ImageAndManagerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(vision.await_count, 2)
 
+    async def test_vision_classification_reaches_diagnostics(self):
+        self.manager.config["multimodal_debug_log"] = True
+
+        async def vision(_uri, info):
+            info.update(
+                sticker=True,
+                raw_is_sticker="true",
+                json_ok=True,
+                sticker_source="is_sticker",
+                content_chars=12,
+            )
+            return "description"
+
+        result = await self.manager.features("", [str(self.image)], vision)
+        row = next(
+            item for item in result["_diagnostics"] if item["stage"] == "vision"
+        )
+        self.assertIs(row["classified_sticker"], True)
+        self.assertEqual(row["raw_is_sticker"], "true")
+        self.assertIs(row["json_ok"], True)
+        self.assertEqual(row["sticker_source"], "is_sticker")
+        self.assertEqual(row["content_chars"], 12)
+
     async def test_image_pixel_limit_and_recompression_hash(self):
         self.manager.images.pixels = 10
         with self.assertRaisesRegex(EmbeddingError, "pixel"):
@@ -402,31 +425,68 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.plugin.context = types.SimpleNamespace(
             get_provider_by_id=lambda _: provider
         )
+        info = {}
         self.assertEqual(
-            await self.plugin._multimodal_vision("data:image/jpeg;base64,AAAA"),
+            await self.plugin._multimodal_vision(
+                "data:image/jpeg;base64,AAAA", info
+            ),
             "新闻截图",
         )
+        self.assertIs(info["sticker"], False)
+        self.assertIs(info["json_ok"], True)
+        self.assertEqual(info["raw_is_sticker"], "False")
+
         provider.text_chat.return_value = types.SimpleNamespace(
             completion_text="纯文本描述"
         )
+        info = {}
         self.assertEqual(
-            await self.plugin._multimodal_vision("data:image/jpeg;base64,AAAA"),
+            await self.plugin._multimodal_vision(
+                "data:image/jpeg;base64,AAAA", info
+            ),
             "纯文本描述",
         )
+        self.assertIsNone(info["sticker"])
+        self.assertIs(info["json_ok"], False)
+        self.assertEqual(info["sticker_source"], "parse_failed")
+
         self.plugin.config["multimodal_sticker_filter_enabled"] = True
         provider.text_chat.return_value = types.SimpleNamespace(
             completion_text='{"is_sticker": true, "content": "表情包"}'
         )
+        info = {}
         self.assertIs(
-            await self.plugin._multimodal_vision("data:image/jpeg;base64,AAAA"),
+            await self.plugin._multimodal_vision(
+                "data:image/jpeg;base64,AAAA", info
+            ),
             False,
         )
+        self.assertIs(info["sticker"], True)
+        self.assertEqual(info["sticker_source"], "is_sticker")
+
+        provider.text_chat.return_value = types.SimpleNamespace(
+            completion_text='{"is_sticker": "yes", "content": "表情包"}'
+        )
+        info = {}
+        self.assertIs(
+            await self.plugin._multimodal_vision(
+                "data:image/jpeg;base64,AAAA", info
+            ),
+            False,
+        )
+        self.assertIs(info["sticker"], True)
+        self.assertEqual(info["raw_is_sticker"], "yes")
+
         provider.text_chat.return_value = types.SimpleNamespace(
             completion_text=""
         )
+        info = {}
         self.assertIsNone(
-            await self.plugin._multimodal_vision("data:image/jpeg;base64,AAAA")
+            await self.plugin._multimodal_vision(
+                "data:image/jpeg;base64,AAAA", info
+            )
         )
+        self.assertEqual(info["sticker_source"], "empty_response")
 
     async def test_vision_description_can_be_disabled(self):
         self.plugin.config.update(

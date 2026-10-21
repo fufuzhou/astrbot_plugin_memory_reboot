@@ -114,7 +114,8 @@ class EmbeddingManager:
                 uri = image.pop("data_uri")
                 if vision:
                     start = time.perf_counter()
-                    description = await vision(uri)
+                    vision_info = {}
+                    description = await vision(uri, vision_info)
                     if diagnostics is not None:
                         diagnostics.append(
                             {
@@ -123,6 +124,11 @@ class EmbeddingManager:
                                 "elapsed_ms": elapsed(start),
                                 "excluded_sticker": description is False,
                                 "has_description": bool(description),
+                                "classified_sticker": vision_info.get("sticker"),
+                                "raw_is_sticker": vision_info.get("raw_is_sticker"),
+                                "json_ok": vision_info.get("json_ok"),
+                                "sticker_source": vision_info.get("sticker_source"),
+                                "content_chars": vision_info.get("content_chars"),
                             }
                         )
                     if description is False:  # Explicit sticker classification only.

@@ -79,13 +79,23 @@ class MultimodalMixin:
             )
         return manager
 
-    async def _multimodal_vision(self, uri):
+    async def _multimodal_vision(self, uri, info=None):
+        def record(**fields):
+            if info is not None:
+                info.update(fields)
+
         provider_id = self.config.get("vision_provider_id", "")
         if not provider_id:
+            record(sticker=None, json_ok=False, sticker_source="no_provider")
             return None
         try:
             provider = self.context.get_provider_by_id(provider_id)
             if provider is None:
+                record(
+                    sticker=None,
+                    json_ok=False,
+                    sticker_source="provider_not_found",
+                )
                 return None
             response = await asyncio.wait_for(
                 provider.text_chat(
@@ -98,6 +108,12 @@ class MultimodalMixin:
             )
             content = str(getattr(response, "completion_text", "") or "").strip()
             if not content:
+                record(
+                    sticker=None,
+                    json_ok=False,
+                    sticker_source="empty_response",
+                    content_chars=0,
+                )
                 return None
             fence = chr(96) * 3
             if fence in content:
@@ -105,17 +121,43 @@ class MultimodalMixin:
             try:
                 value = json.loads(content)
             except (TypeError, ValueError):
-                # Some providers ignore the JSON instruction. Keep the text as an
-                # approximate description rather than discarding a paid response.
+                record(
+                    sticker=None,
+                    json_ok=False,
+                    sticker_source="parse_failed",
+                    content_chars=len(content),
+                )
                 return content[:2000]
             if not isinstance(value, dict):
+                record(
+                    sticker=None,
+                    json_ok=False,
+                    sticker_source="non_object",
+                    content_chars=len(content),
+                )
                 return content[:2000]
-            sticker = str(value.get("is_sticker")).lower() == "true"
+            raw_sticker = value.get("is_sticker", "<missing>")
+            if isinstance(raw_sticker, str):
+                sticker = raw_sticker.strip().lower() in ("true", "yes", "1", "t")
+            else:
+                sticker = bool(raw_sticker)
+            sticker_source = "is_sticker" if sticker else None
+            if str(value.get("type", "")).strip().lower() in ("emoji", "sticker"):
+                sticker = True
+                sticker_source = "type"
+            description = str(value.get("content") or "").strip()[:2000]
+            record(
+                sticker=sticker,
+                raw_is_sticker=str(raw_sticker)[:20],
+                json_ok=True,
+                sticker_source=sticker_source,
+                content_chars=len(description),
+            )
             if sticker and self.config.get("multimodal_sticker_filter_enabled", False):
                 return False
-            description = str(value.get("content") or "").strip()
-            return description[:2000] or None
+            return description or None
         except Exception:
+            record(sticker=None, json_ok=False, sticker_source="error")
             logger.warning("[Memory Reboot] optional vision classification failed")
             return None
 
