@@ -223,6 +223,10 @@ class MemoryRebootPlugin(MultimodalMixin, Star):
 - false：全面提取类型、OCR 关键文字、数字/日期/ID、画面细节；格式为【类型】+ 客观内容。
 - 不要使用“可能/似乎/大概”，不要个人评价。
 
+## 补充规则
+- 无文字、无任何可检索事实信息的简单线条画、抽象图形、图标风、剪贴画风、动画贴纸，即使看起来像图标或 logo，也按 is_sticker=true 处理。
+- 只有包含文字、截图、数据、公告、教程、实拍照片或多格叙事内容时才 false。
+
 ## JSON 示例
 {"is_sticker": true, "content": "猫猫反应图，配文‘怎么会这样’"}
 {"is_sticker": true, "content": "单格梗图，人物表情无语，配文‘我是人工智能的对立面’"}

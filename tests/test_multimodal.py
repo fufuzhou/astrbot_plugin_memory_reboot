@@ -519,6 +519,12 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(info["sticker_source"], "empty_response")
 
+    def test_default_vision_prompt_treats_line_art_as_sticker(self):
+        prompt = MemoryRebootPlugin.DEFAULT_VISION_PROMPT
+        self.assertIn("简单线条画", prompt)
+        self.assertIn("图标风", prompt)
+        self.assertIn("也按 is_sticker=true", prompt)
+
     async def test_vision_description_can_be_disabled(self):
         self.plugin.config.update(
             vision_provider_id="vision",
