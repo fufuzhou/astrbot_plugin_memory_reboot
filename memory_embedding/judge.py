@@ -25,11 +25,21 @@ def match_evidence(current, stored, match, config):
         )
     else:
         coverage = "双方均为纯文本"
+    current_description = str(current.get("image_description") or "").strip()
+    stored_description = str(stored.get("image_description") or "").strip()
+    description_block = ""
+    if current_description or stored_description:
+        description_block = (
+            "\n【图片描述】\n"
+            f"- 当前图片描述：{current_description[:500] or '无'}\n"
+            f"- 历史图片描述：{stored_description[:500] or '无'}\n"
+        )
     return (
         "【程序提供的匹配证据】\n"
         f"- 匹配类型：{kind}\n"
         f"- 完整消息匹配分数：{match['score']:.6f}（不是事实相同的概率）\n"
         f"- 图片覆盖：{coverage}\n"
+        f"{description_block}"
         f"- 正文：当前{'有' if a.get('text') else '无'}，历史{'有' if b.get('text') else '无'}；已按完整消息规则检查\n"
         f"- 语义阈值：文本{threshold(config, 'multimodal_text_threshold', 0.90):.4f}、"
         f"图片{threshold(config, 'multimodal_image_threshold', 0.94):.4f}、"
@@ -39,7 +49,7 @@ def match_evidence(current, stored, match, config):
         "文字和数字；描述指向不同内容时，即使向量分数高，也不得判为重复。\n"
         "- 近期精确复读统计按完整内容/指纹计算，不包含仅语义近似的消息；"
         "它与前置语义匹配的发送者人数口径不同。\n"
-        "- 本请求没有提供原图；如上方附有图片描述，只能把它当作辅助文字，"
+        "- 本请求没有提供原图；如附有图片描述，只能把它当作辅助文字，"
         "不可声称看到了原图细节。"
         "请依据上述匹配证据和聊天上下文判断是否适合提醒，"
         "不要仅因没有原图或图片描述就否定程序已检测到的匹配。"

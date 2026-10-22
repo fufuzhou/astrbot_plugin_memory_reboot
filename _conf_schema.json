@@ -345,6 +345,12 @@
     "default": 0.94,
     "hint": "多图要求全部图片一一匹配，不能只命中一张。"
   },
+  "multimodal_description_threshold": {
+    "description": "图片描述语义阈值（待校准）",
+    "type": "float",
+    "default": 0.8,
+    "hint": "语义图片匹配时，双方图片描述向量的余弦相似度需达到此值；低于则拒绝。缺少描述向量时退回LLM judge。"
+  },
   "multimodal_cross_threshold": {
     "description": "跨模态重复阈值（待校准）",
     "type": "float",

@@ -55,10 +55,11 @@
 |---|---:|
 | 文本重复 | 0.90 |
 | 图片重复 | 0.94 |
+| 图片描述语义重复 | 0.80 |
 | 文字与单图跨模态重复 | 0.94 |
 | 文字搜图 | 0.50 |
 
-这些是待真实群聊标注集校准的初始值。正文中可见数字不一致会拒绝匹配，但默认没有 OCR，不能检测图片中的数字差异。
+这些是待真实群聊标注集校准的初始值。语义图片匹配还会比较双方图片描述的文本向量；描述相似度低于 0.80 时拒绝匹配。旧记录没有描述向量时退回 LLM judge 比较描述。正文中可见数字不一致仍会拒绝，默认没有独立 OCR，不能可靠检测图片中的数字差异。
 
 | 真实服务合成截图样本 | 图片余弦相似度 |
 |---|---:|
@@ -142,7 +143,7 @@ Remove-Item Env:EMBEDDING_API_KEY
 
 vision 阶段新增 classified_sticker（模型是否判为表情包）、raw_is_sticker（模型原始字段值，最多20字符）、json_ok（是否成功解析 JSON）、sticker_source（is_sticker/type/parse_failed/empty_response/error 等）、content_chars、response_chars，以及 response_preview（原始返回截断500字符）和 content_preview（解析后的 content 截断300字符）。预览会遮盖已配置的 API Key、URL/Base64 资源，但可能包含图片描述、OCR 文字或聊天内容，仅排查时开启。
 
-candidate 记录召回分数、确认分数、文本/图片配对分数和拒绝原因；只记录召回 Top-K，不输出全部历史。常见拒绝原因：numbers_conflict（正文数字冲突）、image_coverage_or_threshold（图片不能完整匹配或未达阈值）、caption_presence_mismatch（正文有无不同）、caption_below_threshold、different_vector_space。matching 的 recalled=0 表示没有进入 Top-K 的候选，可能是保留期、空间、完整性或召回阈值条件不符，不等于服务故障。
+candidate 记录召回分数、确认分数、文本/图片配对分数和拒绝原因；只记录召回 Top-K，不输出全部历史。常见拒绝原因：numbers_conflict（正文数字冲突）、image_coverage_or_threshold（图片不能完整匹配或未达阈值）、description_below_threshold（图片描述语义不一致）、caption_presence_mismatch（正文有无不同）、caption_below_threshold、different_vector_space。语义图片匹配会输出 description_score；旧记录缺少描述向量时，在 confirmed 后按需计算并输出 description_gate（candidates/checked/rejected/scores）。matching 的 recalled=0 表示没有进入 Top-K 的候选，可能是保留期、空间、完整性或召回阈值条件不符，不等于服务故障。
 
 gates 展示不同发送者人数、同发送者条件、历史年龄及冷却秒数；decision 展示最终是否计划提醒。该日志不证明消息已成功送达。/记忆状态 同时显示调试开关状态。
 

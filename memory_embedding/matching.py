@@ -38,24 +38,6 @@ def numbers_conflict(a, b):
     return bool(left and right and left != right)
 
 
-DESCRIPTION_NUMBER_OVERLAP_MIN = 0.5
-
-
-def description_numbers_conflict(a, b):
-    """Two image descriptions with mostly different numbers are different content.
-
-    Same-template screenshots (game UIs, news cards, scoreboards) can have high
-    image-vector similarity while the concrete card names, prices or stats are
-    entirely different. Require a meaningful overlap before confirming them.
-    """
-    left = set(re.findall(r"\d+(?:\.\d+)?", str(a or "")))
-    right = set(re.findall(r"\d+(?:\.\d+)?", str(b or "")))
-    if not left or not right:
-        return False
-    common = left & right
-    return len(common) / max(len(left), len(right)) < DESCRIPTION_NUMBER_OVERLAP_MIN
-
-
 def image_assignment(left, right, score, minimum):
     """Find a complete one-to-one assignment, not repeated matches to one image."""
     if not left or len(left) != len(right):
@@ -133,14 +115,16 @@ def compare(current, stored, config, diagnostics=None):
         if image_score is None:
             return reject("image_coverage_or_threshold")
         scores.append(image_score)
-        descriptions_a = " ".join(
-            str(image.get("description") or "") for image in ai
-        )
-        descriptions_b = " ".join(
-            str(image.get("description") or "") for image in bi
-        )
-        if description_numbers_conflict(descriptions_a, descriptions_b):
-            return reject("description_numbers_conflict")
+        description_a = a.get("description_vector")
+        description_b = b.get("description_vector")
+        if description_a and description_b:
+            description_score = cosine(description_a, description_b)
+            if diagnostics is not None:
+                diagnostics["description_score"] = description_score
+            if description_score < threshold(
+                config, "multimodal_description_threshold", 0.80
+            ):
+                return reject("description_below_threshold")
         # Different/additional captions must be checked, not erased by an image hit.
         if bool(at) != bool(bt):
             return reject("caption_presence_mismatch")

@@ -178,6 +178,7 @@
 |--------|------|--------|
 | `similarity_threshold` | 文本相似度阈值 (0.0-1.0) | `0.95` |
 | `image_hash_threshold` | 图片哈希相似度阈值 (0.0-1.0) | `0.90` |
+| `multimodal_description_threshold` | 语义图片匹配时图片描述向量的余弦阈值 | `0.80` |
 | `image_search_semantic_threshold` | 搜图语义相似度阈值 | `0.55` |
 | `image_search_fuzzy_threshold` | 搜图字符模糊匹配阈值 | `0.65` |
 | `min_unique_senders` | 最少不同用户数，达到此人数才触发 | `3` |

@@ -12,7 +12,14 @@ from .diagnostics import elapsed, enabled, safe_reason
 from .images import ImageLoader
 from .judge import exact_repeat, match_evidence
 from .manager import EmbeddingManager
-from .matching import candidates, compare, confirmed_candidates, search_images
+from .matching import (
+    candidates,
+    compare,
+    confirmed_candidates,
+    cosine,
+    search_images,
+    threshold,
+)
 from .provider import EmbeddingError, integer
 
 
@@ -78,6 +85,80 @@ class MultimodalMixin:
                 self.config, images=self._image_loader()
             )
         return manager
+
+    @staticmethod
+    def _clip_utf8(text, limit):
+        """Keep a description within the text-embedding byte budget."""
+        raw = str(text or "").encode("utf-8")
+        if len(raw) <= limit:
+            return str(text or "")
+        return raw[:limit].decode("utf-8", "ignore")
+
+    async def _ensure_description_vector(self, manager, message):
+        multimodal = message.get("multimodal")
+        if not isinstance(multimodal, dict):
+            return None
+        vector = multimodal.get("description_vector")
+        if vector:
+            return vector
+        description = self._get_image_description(message)
+        if not description:
+            return None
+        description = self._clip_utf8(
+            description,
+            integer(self.config, "embedding_max_text_bytes", 900, 64, 20000),
+        )
+        try:
+            vector = await manager.provider.embed_text(description)
+        except EmbeddingError:
+            return None
+        if vector:
+            multimodal["description_vector"] = vector
+        return vector
+
+    async def _filter_description_mismatches(
+        self, trace, manager, current, items, config
+    ):
+        """On-demand description gate for records without a stored vector."""
+        if not items:
+            return items
+        current_vector = await self._ensure_description_vector(manager, current)
+        if not current_vector:
+            self._mm_debug(trace, "description_gate", candidates=len(items), checked=0)
+            return items
+        threshold_value = threshold(
+            config, "multimodal_description_threshold", 0.80
+        )
+        kept = []
+        scores = []
+        checked = 0
+        for item in items:
+            if item.get("kind") == "exact":
+                kept.append(item)
+                continue
+            candidate = item.get("message") or {}
+            candidate_vector = await self._ensure_description_vector(
+                manager, candidate
+            )
+            if not candidate_vector:
+                kept.append(item)
+                continue
+            checked += 1
+            score = cosine(current_vector, candidate_vector)
+            item["_description_score"] = score
+            scores.append(round(score, 6))
+            if score >= threshold_value:
+                kept.append(item)
+        self._mm_debug(
+            trace,
+            "description_gate",
+            candidates=len(items),
+            checked=checked,
+            rejected=len(items) - len(kept),
+            scores=scores,
+            threshold=threshold_value,
+        )
+        return kept
 
     async def _multimodal_vision(self, uri, info=None):
         def record(**fields):
@@ -232,6 +313,41 @@ class MultimodalMixin:
                 for value in (features.pop("descriptions", []) or [])
                 if str(value or "").strip()
             ]
+            description_vector = None
+            if descriptions:
+                description_text = self._clip_utf8(
+                    "\n".join(descriptions),
+                    integer(
+                        self.config,
+                        "embedding_max_text_bytes",
+                        900,
+                        64,
+                        20000,
+                    ),
+                )
+                description_start = time.perf_counter()
+                try:
+                    description_vector = await manager.provider.embed_text(
+                        description_text
+                    )
+                except EmbeddingError as exc:
+                    self._mm_debug(
+                        trace,
+                        "description_embedding",
+                        ok=False,
+                        error=str(exc),
+                        elapsed_ms=elapsed(description_start),
+                    )
+                else:
+                    self._mm_debug(
+                        trace,
+                        "description_embedding",
+                        ok=True,
+                        dimensions=len(description_vector),
+                        elapsed_ms=elapsed(description_start),
+                    )
+                if description_vector:
+                    features["description_vector"] = description_vector
             now = time.time()
             message = {
                 "id": str(uuid.uuid4()),
@@ -266,6 +382,14 @@ class MultimodalMixin:
                 confirmed=len(selected),
                 elapsed_ms=elapsed(matching_start),
             )
+            if selected:
+                selected = await self._filter_description_mismatches(
+                    trace,
+                    manager,
+                    message,
+                    selected,
+                    dict(self.config),
+                )
             if not selected:
                 self._mm_debug(
                     trace, "decision", remind=False, reason="no_confirmed_candidate"
@@ -328,12 +452,12 @@ class MultimodalMixin:
                     )
                     if message.get("image_description"):
                         judge_content += (
-                            "\n已有当前图片描述：" + message["image_description"]
+                            "\n当前图片描述：" + message["image_description"]
                         )
                     judge_match = dict(matched)
                     if matched.get("image_description"):
                         judge_match["content"] += (
-                            "\n已有图片描述：" + matched["image_description"]
+                            "\n历史图片描述：" + matched["image_description"]
                         )
                     judge_start = time.perf_counter()
                     judge_details = {} if enabled(self.config) else None

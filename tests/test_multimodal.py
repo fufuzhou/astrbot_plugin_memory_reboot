@@ -180,25 +180,25 @@ class MatchingTests(unittest.TestCase):
         b["multimodal"]["text_vector"] = [0, 1]
         self.assertIsNone(compare(a, b, {}))
 
-    def test_different_screenshot_numbers_reject_semantic_image_match(self):
+    def test_description_vector_mismatch_rejects_semantic_image_match(self):
         a = message(features(images=[("a", [1, 0])]))
         b = message(features(images=[("b", [0.95, 0.31])]))
-        a["multimodal"]["images"][0]["description"] = (
-            "【游戏截图】卡牌 1费 5费 8费，共4张"
-        )
-        b["multimodal"]["images"][0]["description"] = (
-            "【游戏截图】卡牌 10费12攻12血、4费2攻5血，古神"
-        )
+        a["multimodal"]["description_vector"] = [1, 0]
+        b["multimodal"]["description_vector"] = [0, 1]
         detail = {}
         self.assertIsNone(compare(a, b, {}, detail))
-        self.assertEqual(detail["reason"], "description_numbers_conflict")
+        self.assertEqual(detail["reason"], "description_below_threshold")
 
-    def test_same_screenshot_numbers_still_match_semantically(self):
+    def test_similar_description_vectors_allow_semantic_match(self):
         a = message(features(images=[("a", [1, 0])]))
         b = message(features(images=[("b", [0.95, 0.31])]))
-        description = "【游戏截图】卡牌 1费 5费 8费，共4张"
-        a["multimodal"]["images"][0]["description"] = description
-        b["multimodal"]["images"][0]["description"] = description
+        a["multimodal"]["description_vector"] = [1, 0]
+        b["multimodal"]["description_vector"] = [0.99, 0.01]
+        self.assertEqual(compare(a, b, {})["kind"], "semantic")
+
+    def test_missing_description_vectors_fall_back_to_image_vector(self):
+        a = message(features(images=[("a", [1, 0])]))
+        b = message(features(images=[("b", [0.95, 0.31])]))
         self.assertEqual(compare(a, b, {})["kind"], "semantic")
 
     def test_missing_image_and_extra_caption_are_not_ignored(self):
@@ -388,6 +388,10 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.plugin._mm_manager = types.SimpleNamespace(
             features=AsyncMock(side_effect=lambda *a: copy.deepcopy(self.f)),
             close=AsyncMock(),
+            provider=types.SimpleNamespace(
+                embed_text=AsyncMock(return_value=[1.0, 0.0]),
+                space="test",
+            ),
         )
         self.event = types.SimpleNamespace(
             message_obj=types.SimpleNamespace(message_id="new"),
@@ -576,6 +580,34 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
             ],
             ["first description", "second description"],
         )
+        self.assertEqual(
+            stored["multimodal"]["description_vector"],
+            [1.0, 0.0],
+        )
+
+    async def test_description_gate_rejects_old_semantic_candidate(self):
+        self.f = features(images=[("historical", [1, 0])])
+        self.f["descriptions"] = ["历史卡牌A"]
+        self.f["image_description"] = "历史卡牌A"
+        self.f["images"][0]["description"] = "历史卡牌A"
+        self.seed()
+        for historical in self.plugin._cache["g"]["messages"]:
+            historical["image_description"] = "历史卡牌A"
+            historical["multimodal"].pop("description_vector", None)
+
+        self.f = features(images=[("current", [0.99, 0.1])])
+        self.f["descriptions"] = ["当前卡牌B"]
+        self.f["image_description"] = "当前卡牌B"
+        self.f["images"][0]["description"] = "当前卡牌B"
+
+        async def embed(text):
+            return [1.0, 0.0] if "当前" in text else [0.0, 1.0]
+
+        self.plugin._mm_manager.provider.embed_text.side_effect = embed
+
+        self.assertFalse(await self.process())
+        stored = self.plugin._cache["g"]["messages"][-1]
+        self.assertEqual(stored["multimodal"]["description_vector"], [1.0, 0.0])
 
     async def test_new_fields_round_trip_without_overwriting_old_embedding(self):
         legacy = {

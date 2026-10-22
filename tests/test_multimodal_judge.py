@@ -75,8 +75,16 @@ class JudgeEvidenceTests(unittest.IsolatedAsyncioTestCase):
                 multimodal_debug_log=True,
             )
             case.f = fixtures.features(images=[("historical", [1, 0])])
+            case.f["descriptions"] = ["历史卡牌A"]
+            case.f["image_description"] = "历史卡牌A"
+            case.f["images"][0]["description"] = "历史卡牌A"
             case.seed()
+            for historical in case.plugin._cache["g"]["messages"]:
+                historical["image_description"] = "历史卡牌A"
             case.f = fixtures.features(images=[("current", [0.99, 0.1])])
+            case.f["descriptions"] = ["当前卡牌B"]
+            case.f["image_description"] = "当前卡牌B"
+            case.f["images"][0]["description"] = "当前卡牌B"
             provider = types.SimpleNamespace(
                 text_chat=AsyncMock(
                     return_value=types.SimpleNamespace(
@@ -98,6 +106,8 @@ class JudgeEvidenceTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("全部图片已通过一一匹配", prompt)
             self.assertIn("不是事实相同的概率", prompt)
             self.assertIn("本请求没有提供原图", prompt)
+            self.assertIn("当前图片描述：当前卡牌B", prompt)
+            self.assertIn("历史图片描述：历史卡牌A", prompt)
             self.assertNotIn("image_urls", kwargs)
             rows = [
                 json.loads(c.args[0].split("[MultimodalDebug] ", 1)[1])
