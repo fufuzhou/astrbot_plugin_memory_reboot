@@ -1,8 +1,17 @@
 # Memory Reboot - 记忆重现
 
-> AstrBot 旧闻提醒插件 v3.11.10
+> AstrBot 旧闻提醒插件 v3.11.11
 
 当群聊中有人重复发送旧的新闻、话题、梗图或视频时，自动识别并通过引用回复提醒该用户。
+
+## v3.11.11 图片描述向量主判据
+
+- 语义图片匹配新增图片描述向量比较，默认阈值 `multimodal_description_threshold=0.80`；不同卡牌/标题但版式相似的截图不会再仅凭图片向量被判重复。
+- 新记录保存 `multimodal.description_vector`；旧记录缺少向量时，在候选阶段按需补算并输出 `description_gate` / `description_score`。
+- 移除了按数字重合判定的窄规则。
+- LLM judge 固定收到当前与历史图片描述，即使自定义 `judge_prompt` 没有内容占位符也能比较；默认提示词新增图片描述一致性要求。
+- 默认 `vision_prompt` 增加简单线条画、图标风、剪贴画风、动画贴纸按表情包处理的规则。
+- `multimodal_description_threshold` 仍需用真实群聊样本校准。
 
 ## v3.11.10 视觉返回预览
 

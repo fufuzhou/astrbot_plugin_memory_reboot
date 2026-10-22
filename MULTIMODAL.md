@@ -1,4 +1,4 @@
-# EmbeddingGemma 2 多模态模式（v3.11.10）
+# EmbeddingGemma 2 多模态模式（v3.11.11）
 
 本次按讨论后的范围实现 **LiteLLM → LiteRT-LM → EmbeddingGemma 2 440M**。SiliconFlow、火山方舟留待有实际服务时接入，不提供尚未实现的配置选项。legacy 仍为默认模式。
 
@@ -210,3 +210,11 @@ SnowLuma 的 get_file 只解析图片/语音缓存，不能当作视频取回接
 `vision` 阶段新增 `response_preview`（模型原始返回，最多500字符）、`content_preview`（解析后的 content，最多300字符）和 `response_chars`。预览会遮盖已配置的 API Key、URL/Base64 资源，但可能包含图片描述、OCR 文字或聊天内容，因此只在排查时开启 `multimodal_debug_log`，排查后立即关闭。
 
 通过预览可以直接区分：模型明确回了 `is_sticker: false`、模型返回了无法解析的 JSON、或模型没有返回 `is_sticker` 字段。若确认是模型明确判 false，应调整 `vision_prompt` 或更换视觉模型，而不是继续改解析逻辑。
+
+### 图片描述向量主判据（v3.11.11）
+
+语义图片匹配现在还会比较双方图片描述的文本向量：新记录在保存时计算 `multimodal.description_vector`，匹配时要求余弦相似度达到 `multimodal_description_threshold`（默认 0.80）。旧记录没有向量时，在 `confirmed_candidates` 之后只对候选按需计算，日志输出 `description_gate` 与 `description_score`。原先按数字重合判断的窄规则已移除。
+
+LLM judge 的匹配证据固定附带“当前图片描述”和“历史图片描述”，即使自定义 `judge_prompt` 不包含 `{content}` / `{matched_content}` 也能比较。缺少描述或描述向量时不强行拒绝，退回 LLM judge。
+
+0.80 是初始值，需要按真实群聊样本校准：不同内容的描述分数仍高于阈值时调高，正常重复被误拒时调低。
