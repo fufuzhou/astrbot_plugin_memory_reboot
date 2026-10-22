@@ -262,6 +262,10 @@ class MemoryRebootPlugin(MultimodalMixin, Star):
 发送者：{sender_name}
 内容：{content}
 
+## 图片描述一致性
+- 如果历史参考和当前消息都附有“图片描述”，必须比较描述中的具体对象、卡牌/人物/标题、文字和数字。
+- 描述明显指向不同内容（例如卡牌名称/费用/数值/标题不同）时，即使程序报告语义相似，也应判为不同内容，不要提醒。
+
 ## 判断逻辑
 
 **提醒（should_remind: true）的情况：**

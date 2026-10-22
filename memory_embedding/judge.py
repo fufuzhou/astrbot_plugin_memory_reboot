@@ -35,6 +35,8 @@ def match_evidence(current, stored, match, config):
         f"图片{threshold(config, 'multimodal_image_threshold', 0.94):.4f}、"
         f"跨模态{threshold(config, 'multimodal_cross_threshold', 0.94):.4f}（精确匹配不依赖语义阈值）\n"
         "- [图片×N]只表示图片数量；相同占位符不代表同一图片。\n"
+        "- 如果双方附有图片描述，必须比较描述中的具体对象、卡牌/人物/标题、"
+        "文字和数字；描述指向不同内容时，即使向量分数高，也不得判为重复。\n"
         "- 近期精确复读统计按完整内容/指纹计算，不包含仅语义近似的消息；"
         "它与前置语义匹配的发送者人数口径不同。\n"
         "- 本请求没有提供原图；如上方附有图片描述，只能把它当作辅助文字，"

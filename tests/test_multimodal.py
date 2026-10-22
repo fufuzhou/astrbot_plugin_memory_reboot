@@ -180,6 +180,27 @@ class MatchingTests(unittest.TestCase):
         b["multimodal"]["text_vector"] = [0, 1]
         self.assertIsNone(compare(a, b, {}))
 
+    def test_different_screenshot_numbers_reject_semantic_image_match(self):
+        a = message(features(images=[("a", [1, 0])]))
+        b = message(features(images=[("b", [0.95, 0.31])]))
+        a["multimodal"]["images"][0]["description"] = (
+            "【游戏截图】卡牌 1费 5费 8费，共4张"
+        )
+        b["multimodal"]["images"][0]["description"] = (
+            "【游戏截图】卡牌 10费12攻12血、4费2攻5血，古神"
+        )
+        detail = {}
+        self.assertIsNone(compare(a, b, {}, detail))
+        self.assertEqual(detail["reason"], "description_numbers_conflict")
+
+    def test_same_screenshot_numbers_still_match_semantically(self):
+        a = message(features(images=[("a", [1, 0])]))
+        b = message(features(images=[("b", [0.95, 0.31])]))
+        description = "【游戏截图】卡牌 1费 5费 8费，共4张"
+        a["multimodal"]["images"][0]["description"] = description
+        b["multimodal"]["images"][0]["description"] = description
+        self.assertEqual(compare(a, b, {})["kind"], "semantic")
+
     def test_missing_image_and_extra_caption_are_not_ignored(self):
         a = message(features(images=[("a", [1, 0])], complete=False))
         b = message(features(images=[("a", [1, 0])]))
